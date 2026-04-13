@@ -151,7 +151,7 @@ private:
     void SetHomebind(Player* player, uint32 mapId, float x, float y, float z) const;
     void Jail(Player* player, AegisPlayerContext& ctx) const;
     void Release(Player* player, AegisPlayerContext& ctx) const;
-    std::string BuildBanReason(AegisEvidenceEvent const& evidence, AegisPlayerContext const& ctx, float risk) const;
+    std::string BuildBanReason(AegisEvidenceEvent const& evidence, uint32 offenseCount, uint8 offenseTier, float risk) const;
     std::string ExecuteBan(Player* player, AegisActionDecision const& decision) const;
     bool ClearCoreBanState(uint32 guidLow, uint32 accountId, std::string const& banMode, Player* player) const;
     void SavePunishState(Player* player, AegisPlayerContext const& ctx) const;

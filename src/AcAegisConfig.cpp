@@ -58,7 +58,7 @@ void AcAegisConfig::Reload()
 {
     _config.enabled = sConfigMgr->GetOption<bool>("AcAegis.Enabled", true);
     _config.enabledOnGmAccounts = sConfigMgr->GetOption<bool>("AcAegis.EnabledOnGmAccounts", false);
-    _config.autoEnsureSchema = sConfigMgr->GetOption<bool>("AcAegis.Schema.AutoEnsure", true);
+    _config.autoEnsureSchema = false;
 
     _config.logEnabled = sConfigMgr->GetOption<bool>("AcAegis.Log.Enabled", true);
     _config.verboseLog = sConfigMgr->GetOption<bool>("AcAegis.Log.Verbose", false);
@@ -67,6 +67,9 @@ void AcAegisConfig::Reload()
     _config.fileLogPath = sConfigMgr->GetOption<std::string>("AcAegis.Log.File.Path", "./logs/aegis.log");
     _config.gmNotifyFormat = SanitizeLower(sConfigMgr->GetOption<std::string>("AcAegis.Log.GmNotify.Format", "compact"));
     _config.gmNotifyCooldownMs = sConfigMgr->GetOption<uint32>("AcAegis.Log.GmNotify.CooldownMs", 10000);
+    _config.eventBatchSize = sConfigMgr->GetOption<uint32>("AcAegis.Log.Event.BatchSize", 32);
+    _config.eventFlushIntervalMs = sConfigMgr->GetOption<uint32>("AcAegis.Log.Event.FlushIntervalMs", 1000);
+    _config.eventQueueLimit = sConfigMgr->GetOption<uint32>("AcAegis.Log.Event.QueueLimit", 4096);
 
     _config.panelOutputEnabled = sConfigMgr->GetOption<bool>("AcAegis.Panel.Enabled", false);
     _config.panelWriteDetections = sConfigMgr->GetOption<bool>("AcAegis.Panel.WriteDetections", true);
@@ -233,6 +236,7 @@ void AcAegisConfig::Reload()
 
     _config.kickEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Kick.Enabled", true);
     _config.banEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Ban.Enabled", true);
+    _config.punishBroadcastEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Broadcast.Enabled", true);
     _config.banMode = SanitizeLower(sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Ban.Mode", "account-by-character"));
     _config.banStrongEvidenceRequired = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Ban.StrongEvidenceRequired", true);
     _config.banMinOffenseCount = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.MinOffenseCount", 2);
@@ -257,6 +261,9 @@ void AcAegisConfig::Reload()
     _config.samplingBufferSize = std::clamp<uint32>(_config.samplingBufferSize, 2, 256);
     _config.summaryLogIntervalMs = std::max<uint32>(1000, _config.summaryLogIntervalMs);
     _config.gmNotifyCooldownMs = std::max<uint32>(1000, _config.gmNotifyCooldownMs);
+    _config.eventBatchSize = std::clamp<uint32>(_config.eventBatchSize, 1, 512);
+    _config.eventFlushIntervalMs = std::clamp<uint32>(_config.eventFlushIntervalMs, 100, 10000);
+    _config.eventQueueLimit = std::max<uint32>(_config.eventBatchSize, _config.eventQueueLimit);
     _config.riskHalfLifeSeconds = std::max(1.0f, _config.riskHalfLifeSeconds);
     _config.riskMaxDeltaPerMove = std::max(1.0f, _config.riskMaxDeltaPerMove);
 

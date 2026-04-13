@@ -124,6 +124,8 @@ AegisGeometryResult AcAegisGeometry::CheckLongPath(Player* player,
     AegisMoveSample const& from,
     AegisMoveSample const& to) const
 {
+    AegisConfig const& cfg = sAcAegisConfig->Get();
+
     AegisGeometryResult result;
     result.checked = true;
     result.directDistance = Dist3D(from.x, from.y, from.z, to.x, to.y, to.z);
@@ -132,6 +134,14 @@ AegisGeometryResult AcAegisGeometry::CheckLongPath(Player* player,
     {
         result.pathLength = result.directDistance;
         result.reason = "path-no-player";
+        return result;
+    }
+
+    if (!cfg.useMmaps)
+    {
+        result.checked = false;
+        result.pathLength = result.directDistance;
+        result.reason = "mmap-disabled";
         return result;
     }
 

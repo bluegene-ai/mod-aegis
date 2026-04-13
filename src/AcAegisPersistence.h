@@ -26,6 +26,24 @@ struct AegisOffenseRecord
     std::string lastBanResult;
 };
 
+struct AegisEventRecord
+{
+    uint32 guid = 0;
+    uint32 accountId = 0;
+    uint32 mapId = 0;
+    uint32 zoneId = 0;
+    uint32 areaId = 0;
+    uint8 cheatType = 0;
+    uint8 evidenceLevel = 0;
+    float riskDelta = 0.0f;
+    float totalRiskAfter = 0.0f;
+    std::string evidenceTag;
+    std::string detailText;
+    float posX = 0.0f;
+    float posY = 0.0f;
+    float posZ = 0.0f;
+};
+
 class AcAegisPersistence
 {
 public:
@@ -35,7 +53,7 @@ public:
     std::vector<AegisOffenseRecord> LoadAllOffenses() const;
     std::vector<AegisOffenseRecord> LoadExpiredTempBans(int64 nowEpoch) const;
     void SaveOffense(AegisOffenseRecord const& record) const;
-    void InsertEvent(Player* player, AegisEvidenceEvent const& eventData, float totalRisk) const;
+    void QueueEvent(AegisEventRecord const& eventRecord) const;
     void DeleteOffense(uint32 guidLow) const;
     void DeletePlayerData(uint32 guidLow) const;
     void PurgeAllData() const;

@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #include "AccountMgr.h"
 #include "BanMgr.h"
@@ -57,6 +61,172 @@ namespace
     float ClampRiskDelta(float value)
     {
         return std::clamp(value, 0.0f, sAcAegisConfig->Get().riskMaxDeltaPerMove);
+    }
+
+    struct QueuedLogLine
+    {
+        std::string path;
+        std::string line;
+        bool prepareOnly = false;
+    };
+
+    class AsyncFileAppender
+    {
+    public:
+        AsyncFileAppender() : _worker(&AsyncFileAppender::Run, this) { }
+
+        ~AsyncFileAppender()
+        {
+            Shutdown();
+        }
+
+        void PreparePath(std::string const& path)
+        {
+            Enqueue(path, std::string(), true);
+        }
+
+        void Append(std::string const& path, std::string const& line)
+        {
+            Enqueue(path, line, false);
+        }
+
+    private:
+        void Enqueue(std::string const& path, std::string const& line,
+            bool prepareOnly)
+        {
+            if (path.empty())
+                return;
+
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                _queue.push_back({ path, line, prepareOnly });
+            }
+
+            _condition.notify_one();
+        }
+
+        void Shutdown()
+        {
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_stopping)
+                    return;
+
+                _stopping = true;
+            }
+
+            _condition.notify_one();
+            if (_worker.joinable())
+                _worker.join();
+
+            FlushAll();
+        }
+
+        void Run()
+        {
+            for (;;)
+            {
+                QueuedLogLine entry;
+
+                {
+                    std::unique_lock<std::mutex> lock(_mutex);
+                    _condition.wait(lock, [this]()
+                    {
+                        return _stopping || !_queue.empty();
+                    });
+
+                    if (_queue.empty())
+                    {
+                        if (_stopping)
+                            break;
+
+                        continue;
+                    }
+
+                    entry = std::move(_queue.front());
+                    _queue.pop_front();
+                }
+
+                Write(entry);
+
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_queue.empty())
+                    FlushAll();
+            }
+        }
+
+        std::ofstream& EnsureStream(std::string const& path)
+        {
+            auto it = _streams.find(path);
+            if (it != _streams.end() && it->second.is_open())
+                return it->second;
+
+            std::filesystem::path filePath(path);
+            std::error_code error;
+            std::filesystem::create_directories(filePath.parent_path(), error);
+
+            std::ofstream& stream = _streams[path];
+            if (!stream.is_open())
+                stream.open(path, std::ios::out | std::ios::app);
+
+            return stream;
+        }
+
+        void Write(QueuedLogLine const& entry)
+        {
+            std::ofstream& stream = EnsureStream(entry.path);
+            if (!stream.is_open())
+                return;
+
+            if (entry.prepareOnly)
+                return;
+
+            stream << entry.line;
+            if (entry.line.empty() || entry.line.back() != '\n')
+                stream << '\n';
+        }
+
+        void FlushAll()
+        {
+            for (auto& [path, stream] : _streams)
+            {
+                (void)path;
+                if (stream.is_open())
+                    stream.flush();
+            }
+        }
+
+    private:
+        std::mutex _mutex;
+        std::condition_variable _condition;
+        std::deque<QueuedLogLine> _queue;
+        std::unordered_map<std::string, std::ofstream> _streams;
+        std::thread _worker;
+        bool _stopping = false;
+    };
+
+    AsyncFileAppender& GetAsyncFileAppender()
+    {
+        static AsyncFileAppender appender;
+        return appender;
+    }
+
+    bool ShouldCountOffenseForPunishStage(AegisPunishStage stage,
+        AegisConfig const& cfg)
+    {
+        return cfg.offenseEnabled && stage != AegisPunishStage::Observe;
+    }
+
+    bool ShouldPersistOffense(AegisPunishStage stage, bool shouldRollback,
+        AegisConfig const& cfg)
+    {
+        if (!cfg.offenseEnabled)
+            return false;
+
+        if (cfg.offenseCountOnlyOnPunish)
+            return stage != AegisPunishStage::Observe;
+
+        return shouldRollback || stage != AegisPunishStage::Observe;
     }
 
     char const* CheatTypeText(AegisCheatType type)
@@ -1223,10 +1393,8 @@ void AcAegisMgr::EnsureFileLogReady() const
     if (!sAcAegisConfig->Get().logEnabled)
         return;
 
-    std::filesystem::path path(ResolveLogPath(sAcAegisConfig->Get().fileLogPath));
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    std::ofstream output(path.string(), std::ios::out | std::ios::app);
+    GetAsyncFileAppender().PreparePath(
+        ResolveLogPath(sAcAegisConfig->Get().fileLogPath));
 }
 
 void AcAegisMgr::WriteAegisLog(std::string const& level, std::string const& message) const
@@ -1260,13 +1428,7 @@ void AcAegisMgr::AppendTextLine(std::string const& path, std::string const& line
     if (path.empty())
         return;
 
-    std::ofstream output(path, std::ios::out | std::ios::app);
-    if (!output.is_open())
-        return;
-
-    output << line;
-    if (line.empty() || line.back() != '\n')
-        output << '\n';
+    GetAsyncFileAppender().Append(path, line);
 }
 
 void AcAegisMgr::WritePanelCharacterLog(std::string const& action, std::string const& stage, std::string const& payload) const
@@ -1731,7 +1893,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
 
     AegisGeometryResult longPath;
     bool hasLongPath = false;
-    if (cumulativePath)
+    if (cumulativePath && cfg.useMmaps)
     {
         longPath = _geometry.CheckLongPath(player, *start, cur);
         hasLongPath = true;
@@ -2402,12 +2564,13 @@ void AcAegisMgr::Release(Player* player, AegisPlayerContext& ctx) const
     WriteAuditLog("release_apply", player, &ctx, audit.str());
 }
 
-std::string AcAegisMgr::BuildBanReason(AegisEvidenceEvent const& evidence, AegisPlayerContext const& ctx, float risk) const
+std::string AcAegisMgr::BuildBanReason(AegisEvidenceEvent const& evidence,
+    uint32 offenseCount, uint8 offenseTier, float risk) const
 {
     std::string reason = sAcAegisConfig->Get().banReasonTemplate;
     ReplaceAll(reason, "{type}", CheatTypeText(evidence.cheatType));
-    ReplaceAll(reason, "{tier}", std::to_string(ctx.punish.offenseTier));
-    ReplaceAll(reason, "{offense}", std::to_string(ctx.punish.offenseCount));
+    ReplaceAll(reason, "{tier}", std::to_string(offenseTier));
+    ReplaceAll(reason, "{offense}", std::to_string(offenseCount));
     ReplaceAll(reason, "{risk}", std::to_string(static_cast<uint32>(risk)));
     return reason;
 }
@@ -2545,13 +2708,10 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
         RaisePunishStage(baseStage, ctx.punish.offenseTier, cfg) :
         baseStage;
 
-    decision.persistOffense = cfg.offenseEnabled &&
-        (decision.shouldRollback ||
-            finalStage != AegisPunishStage::Observe);
-
-    uint32 pendingOffenseCount =
-        ctx.punish.offenseCount + (decision.persistOffense ? 1u : 0u);
-    uint8 pendingTier = decision.persistOffense ?
+    uint32 pendingPunishOffenseCount =
+        ctx.punish.offenseCount +
+        (ShouldCountOffenseForPunishStage(finalStage, cfg) ? 1u : 0u);
+    uint8 pendingPunishTier = ShouldCountOffenseForPunishStage(finalStage, cfg) ?
         static_cast<uint8>(std::min<uint32>(cfg.offenseMaxTier,
             ctx.punish.offenseTier + 1)) :
         ctx.punish.offenseTier;
@@ -2562,18 +2722,14 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
             (!cfg.banStrongEvidenceRequired ||
                 evidence.level == AegisEvidenceLevel::Strong) &&
             (!cfg.offenseEnabled ||
-                pendingOffenseCount >= cfg.banMinOffenseCount);
+                pendingPunishOffenseCount >= cfg.banMinOffenseCount);
 
         if (!allowBan)
             finalStage = AegisPunishStage::Kick;
         else if (finalStage == AegisPunishStage::PermBan &&
-            (!cfg.stage5Permanent || pendingTier < cfg.banPermanentTier))
+            (!cfg.stage5Permanent || pendingPunishTier < cfg.banPermanentTier))
             finalStage = AegisPunishStage::TempBan;
     }
-
-    if (finalStage == AegisPunishStage::Observe &&
-        !decision.shouldRollback)
-        return decision;
 
     bool positionCheatNeedsRollback =
         IsPositionMovementCheat(evidence.cheatType) &&
@@ -2591,11 +2747,23 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
                 (evidence.level == AegisEvidenceLevel::Strong ||
                     ctx.riskScore >= cfg.rollbackThreshold)));
 
+    decision.persistOffense = ShouldPersistOffense(finalStage,
+        decision.shouldRollback, cfg);
+    decision.pendingOffenseCount = ctx.punish.offenseCount +
+        (decision.persistOffense ? 1u : 0u);
+    decision.pendingOffenseTier = decision.persistOffense ?
+        static_cast<uint8>(std::min<uint32>(cfg.offenseMaxTier,
+            std::max<uint32>(1, ctx.punish.offenseTier + 1))) :
+        ctx.punish.offenseTier;
+
     if (finalStage == AegisPunishStage::Observe &&
         !decision.shouldRollback)
         return decision;
 
-    decision.reason = BuildBanReason(evidence, ctx, ctx.riskScore);
+    decision.reason = BuildBanReason(evidence,
+        decision.pendingOffenseCount,
+        decision.pendingOffenseTier,
+        ctx.riskScore);
 
     switch (finalStage)
     {
@@ -2618,7 +2786,8 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
         else
             decision.primaryAction = AegisActionType::BanAccountByCharacter;
         decision.banMode = cfg.banMode;
-        decision.banSeconds = (ctx.punish.offenseTier + 1 >= 4 ? cfg.stage4BanDays : cfg.stage3BanDays) * DAY;
+        decision.banSeconds =
+            (decision.pendingOffenseTier >= 4 ? cfg.stage4BanDays : cfg.stage3BanDays) * DAY;
         break;
     case AegisPunishStage::PermBan:
         if (cfg.banMode == "character")
@@ -2694,8 +2863,8 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
     if (decision.persistOffense && cfg.offenseEnabled)
     {
         ctx.punish.loaded = true;
-        ++ctx.punish.offenseCount;
-        ctx.punish.offenseTier = static_cast<uint8>(std::min<uint32>(cfg.offenseMaxTier, std::max<uint32>(1, ctx.punish.offenseTier + 1)));
+        ctx.punish.offenseCount = decision.pendingOffenseCount;
+        ctx.punish.offenseTier = decision.pendingOffenseTier;
         ctx.punish.lastOffenseEpoch = nowEpoch;
         ctx.punish.lastCheatType = static_cast<uint8>(evidence.cheatType);
         ctx.punish.lastReason = decision.reason;
@@ -2781,7 +2950,8 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
 
     SavePunishState(playerGuid, accountId, ctx);
 
-    if ((actionTaken || rollbackExecuted) && announcedAction != AegisActionType::None)
+    if (cfg.punishBroadcastEnabled && (actionTaken || rollbackExecuted) &&
+        announcedAction != AegisActionType::None)
     {
         std::string cheatLabel = std::string(CheatTypeTextZh(evidence.cheatType));
         if (!evidence.tag.empty())
@@ -2849,7 +3019,24 @@ bool AcAegisMgr::HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEv
         ++ctx.gather.suspiciousWindows;
     }
 
-    _persistence.InsertEvent(player, evidence, ctx.riskScore);
+    AegisEventRecord eventRecord;
+    eventRecord.guid = player->GetGUID().GetCounter();
+    eventRecord.accountId = player->GetSession() ?
+        player->GetSession()->GetAccountId() : 0;
+    eventRecord.mapId = player->GetMapId();
+    eventRecord.zoneId = player->GetZoneId();
+    eventRecord.areaId = player->GetAreaId();
+    eventRecord.cheatType = static_cast<uint8>(evidence.cheatType);
+    eventRecord.evidenceLevel = static_cast<uint8>(evidence.level);
+    eventRecord.riskDelta = evidence.riskDelta;
+    eventRecord.totalRiskAfter = ctx.riskScore;
+    eventRecord.evidenceTag = evidence.tag;
+    eventRecord.detailText = evidence.detail;
+    eventRecord.posX = player->GetPositionX();
+    eventRecord.posY = player->GetPositionY();
+    eventRecord.posZ = player->GetPositionZ();
+
+    _persistence.QueueEvent(eventRecord);
     WritePanelDetectionLog(player, evidence, ctx);
     AegisActionDecision decision = DetermineAction(player, ctx, evidence);
 
@@ -2880,8 +3067,6 @@ void AcAegisMgr::ReloadConfig()
     sAcAegisConfig->Reload();
     EnsureFileLogReady();
     WriteAegisLog("info", std::string("config reloaded, file_log=") + ResolveLogPath(sAcAegisConfig->Get().fileLogPath));
-    if (sAcAegisConfig->Get().enabled && sAcAegisConfig->Get().autoEnsureSchema)
-        _persistence.EnsureSchema();
 }
 
 bool AcAegisMgr::GetPlayerDebugSnapshot(uint32 guidLow, AegisPlayerDebugSnapshot& outSnapshot) const

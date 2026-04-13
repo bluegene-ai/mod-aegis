@@ -282,6 +282,8 @@ struct AegisActionDecision
     bool shouldNotify = false;
     bool shouldRollback = false;
     bool persistOffense = false;
+    uint32 pendingOffenseCount = 0;
+    uint8 pendingOffenseTier = 0;
     uint32 debuffSeconds = 0;
     uint32 jailSeconds = 0;
     uint32 banSeconds = 0;

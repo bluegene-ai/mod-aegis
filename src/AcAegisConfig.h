@@ -10,7 +10,7 @@ struct AegisConfig
 {
     bool enabled = true;
     bool enabledOnGmAccounts = false;
-    bool autoEnsureSchema = true;
+    bool autoEnsureSchema = false;
 
     bool logEnabled = true;
     bool verboseLog = false;
@@ -19,6 +19,9 @@ struct AegisConfig
     std::string fileLogPath = "./logs/aegis.log";
     std::string gmNotifyFormat = "compact";
     uint32 gmNotifyCooldownMs = 10000;
+    uint32 eventBatchSize = 32;
+    uint32 eventFlushIntervalMs = 1000;
+    uint32 eventQueueLimit = 4096;
 
     bool panelOutputEnabled = false;
     bool panelWriteDetections = true;
@@ -185,6 +188,7 @@ struct AegisConfig
 
     bool kickEnabled = true;
     bool banEnabled = true;
+    bool punishBroadcastEnabled = true;
     std::string banMode = "account-by-character";
     bool banStrongEvidenceRequired = true;
     uint32 banMinOffenseCount = 2;

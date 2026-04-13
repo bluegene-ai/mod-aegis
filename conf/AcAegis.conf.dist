@@ -16,6 +16,7 @@
 # - AcAegis.Log.File.Path 支持自定义路径。
 # - 默认值为 worldserver 当前工作目录下的 ./logs/aegis.log。
 # - 如果目录或文件不存在，模块会在配置加载时自动创建。
+# - 文件日志使用后台线程异步缓冲写入，避免每次 append 都同步开关文件。
 ###################################################################################################
 
 ###################################################################################################
@@ -30,8 +31,9 @@ AcAegis.Enabled = 1
 # 一般建议保持 0，避免误伤在线排查或人工测试。
 AcAegis.EnabledOnGmAccounts = 0
 
-# 启动或重载配置时，是否自动检查并创建 Aegis 所需数据表。
-AcAegis.Schema.AutoEnsure = 1
+# 运行时自动建表已禁用，Aegis 表结构必须通过 SQL 迁移脚本维护。
+# 保留此项仅为兼容旧配置；当前版本中它不再触发任何 DDL。
+AcAegis.Schema.AutoEnsure = 0
 
 ###################################################################################################
 # Log / 日志与 GM 通知
@@ -67,6 +69,17 @@ AcAegis.Log.GmNotify.Format = compact
 # 同一玩家同类证据的 GM 通知冷却时间，单位毫秒。
 # 用于避免刷屏。
 AcAegis.Log.GmNotify.CooldownMs = 10000
+
+# 事件入库批量大小。
+# Aegis 会把检测事件放入后台队列，按批写入 characters 库，降低主线程热写压力。
+AcAegis.Log.Event.BatchSize = 32
+
+# 事件入库后台刷盘间隔，单位毫秒。
+AcAegis.Log.Event.FlushIntervalMs = 1000
+
+# 事件入库队列上限。
+# 队列打满后，新事件会被丢弃并写警告日志，避免高峰期把主流程拖垮。
+AcAegis.Log.Event.QueueLimit = 4096
 
 ###################################################################################################
 # Panel Output / 与现有 AGMP 后台日志联动
@@ -500,6 +513,7 @@ AcAegis.Geometry.Enabled = 1
 AcAegis.Geometry.UseVmaps = 1
 
 # 是否使用 MMAP / 路径系统。
+# 关闭后，BlockedMicroPath 不再使用 MMAP 长路径复核，只保留短线段几何判定。
 AcAegis.Geometry.UseMmaps = 1
 
 # 是否允许在热点路径直接做 reachability 检查。
@@ -607,6 +621,10 @@ AcAegis.AutoAction.Kick.Enabled = 1
 # 是否允许自动封禁。
 AcAegis.AutoAction.Ban.Enabled = 1
 
+# 是否在处罚落地后发全服广播。
+# 默认开启；如果你希望收敛曝光面，可设为 0。
+AcAegis.AutoAction.Broadcast.Enabled = 1
+
 # 封禁模式。
 # character = 封角色
 # account = 封账号名
@@ -648,6 +666,7 @@ AcAegis.Offense.Enabled = 1
 
 # 是否只在实际处罚发生时才累计 offense。
 # 建议保持 1，避免仅有观察级别事件也把 offense 拉高。
+# 当设为 0 时，带 rollback 的 observe 级事件也会累计 offense，便于更激进地升级处罚。
 AcAegis.Offense.CountOnlyOnPunish = 1
 
 # offense 衰减窗口，单位天。

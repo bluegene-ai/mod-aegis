@@ -1,6 +1,15 @@
 #include "AcAegisPersistence.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+#include "AcAegisConfig.h"
 #include "DatabaseEnv.h"
+#include "Log.h"
 #include "Player.h"
 #include "WorldSession.h"
 
@@ -29,56 +38,192 @@ namespace
         outRecord.lastBanMode = field[12].Get<std::string>();
         outRecord.lastBanResult = field[13].Get<std::string>();
     }
+
+    class AsyncEventWriter
+    {
+    public:
+        AsyncEventWriter() : _worker(&AsyncEventWriter::Run, this) { }
+
+        ~AsyncEventWriter()
+        {
+            Shutdown();
+        }
+
+        void Enqueue(AegisEventRecord const& eventRecord)
+        {
+            AegisConfig const& cfg = sAcAegisConfig->Get();
+
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_queue.size() >= cfg.eventQueueLimit)
+                {
+                    ++_droppedCount;
+                    return;
+                }
+
+                _queue.push_back(eventRecord);
+            }
+
+            _condition.notify_one();
+        }
+
+    private:
+        void Shutdown()
+        {
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_stopping)
+                    return;
+
+                _stopping = true;
+            }
+
+            _condition.notify_one();
+            if (_worker.joinable())
+                _worker.join();
+        }
+
+        void Run()
+        {
+            for (;;)
+            {
+                std::vector<AegisEventRecord> batch;
+
+                {
+                    std::unique_lock<std::mutex> lock(_mutex);
+                    uint32 flushMs = sAcAegisConfig->Get().eventFlushIntervalMs;
+                    uint32 batchSize = sAcAegisConfig->Get().eventBatchSize;
+                    _condition.wait_for(lock,
+                        std::chrono::milliseconds(flushMs),
+                        [this, batchSize]()
+                        {
+                            return _stopping || _queue.size() >= batchSize;
+                        });
+
+                    if (!_queue.empty())
+                        DrainBatch(batch, batchSize);
+
+                    if (_stopping && batch.empty() && _queue.empty())
+                        break;
+                }
+
+                if (!batch.empty())
+                    FlushBatch(batch);
+
+                MaybeLogDropped();
+            }
+
+            std::vector<AegisEventRecord> remaining;
+            for (;;)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    DrainBatch(remaining, sAcAegisConfig->Get().eventBatchSize);
+                }
+
+                if (remaining.empty())
+                    break;
+
+                FlushBatch(remaining);
+            }
+
+            MaybeLogDropped(true);
+        }
+
+        void DrainBatch(std::vector<AegisEventRecord>& outBatch, size_t limit)
+        {
+            outBatch.clear();
+            limit = std::max<size_t>(1, limit);
+
+            while (!_queue.empty() && outBatch.size() < limit)
+            {
+                outBatch.push_back(std::move(_queue.front()));
+                _queue.pop_front();
+            }
+        }
+
+        void FlushBatch(std::vector<AegisEventRecord> const& batch)
+        {
+            if (batch.empty())
+                return;
+
+            std::ostringstream sql;
+            sql << "INSERT INTO ac_aegis_event (guid, account_id, map_id, zone_id, area_id, "
+                   "cheat_type, evidence_level, risk_delta, total_risk_after, evidence_tag, "
+                   "detail_text, pos_x, pos_y, pos_z) VALUES ";
+
+            for (size_t index = 0; index < batch.size(); ++index)
+            {
+                if (index > 0)
+                    sql << ',';
+
+                std::string tag = EscapeForCharacterDb(batch[index].evidenceTag);
+                std::string detail = EscapeForCharacterDb(batch[index].detailText);
+                sql << '(' << batch[index].guid
+                    << ',' << batch[index].accountId
+                    << ',' << batch[index].mapId
+                    << ',' << batch[index].zoneId
+                    << ',' << batch[index].areaId
+                    << ',' << static_cast<uint32>(batch[index].cheatType)
+                    << ',' << static_cast<uint32>(batch[index].evidenceLevel)
+                    << ',' << batch[index].riskDelta
+                    << ',' << batch[index].totalRiskAfter
+                    << ", '" << tag << "', '" << detail << "', "
+                    << batch[index].posX
+                    << ',' << batch[index].posY
+                    << ',' << batch[index].posZ
+                    << ')';
+            }
+
+            CharacterDatabase.DirectExecute(sql.str());
+        }
+
+        void MaybeLogDropped(bool force = false)
+        {
+            uint32 dropped = 0;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (!force && _droppedCount == 0)
+                    return;
+
+                auto now = std::chrono::steady_clock::now();
+                if (!force && (now - _lastDropLogAt) < std::chrono::seconds(10))
+                    return;
+
+                dropped = _droppedCount;
+                _droppedCount = 0;
+                _lastDropLogAt = now;
+            }
+
+            if (dropped > 0)
+                LOG_WARN("module", "[AcAegis] Dropped {} queued event rows due to event queue pressure", dropped);
+        }
+
+    private:
+        std::mutex _mutex;
+        std::condition_variable _condition;
+        std::deque<AegisEventRecord> _queue;
+        std::thread _worker;
+        std::chrono::steady_clock::time_point _lastDropLogAt = std::chrono::steady_clock::now();
+        uint32 _droppedCount = 0;
+        bool _stopping = false;
+    };
+
+    AsyncEventWriter& GetAsyncEventWriter()
+    {
+        static AsyncEventWriter writer;
+        return writer;
+    }
 }
 
 void AcAegisPersistence::EnsureSchema() const
 {
-    CharacterDatabase.Execute(
-        "CREATE TABLE IF NOT EXISTS ac_aegis_offense ("
-        "guid INT UNSIGNED NOT NULL, "
-        "account_id INT UNSIGNED NOT NULL DEFAULT 0, "
-        "offense_count INT UNSIGNED NOT NULL DEFAULT 0, "
-        "offense_tier TINYINT UNSIGNED NOT NULL DEFAULT 0, "
-        "punish_stage TINYINT UNSIGNED NOT NULL DEFAULT 0, "
-        "last_cheat_type TINYINT UNSIGNED NOT NULL DEFAULT 0, "
-        "last_offense_at BIGINT NOT NULL DEFAULT 0, "
-        "debuff_until BIGINT NOT NULL DEFAULT 0, "
-        "jail_until BIGINT NOT NULL DEFAULT 0, "
-        "ban_until BIGINT NOT NULL DEFAULT 0, "
-        "permanent_ban TINYINT(1) NOT NULL DEFAULT 0, "
-        "last_reason VARCHAR(255) NOT NULL DEFAULT '', "
-        "last_ban_mode VARCHAR(32) NOT NULL DEFAULT '', "
-        "last_ban_result VARCHAR(64) NOT NULL DEFAULT '', "
-        "PRIMARY KEY (guid), "
-        "KEY idx_ac_aegis_offense_account (account_id), "
-        "KEY idx_ac_aegis_offense_stage (punish_stage), "
-        "KEY idx_ac_aegis_offense_last_offense (last_offense_at)"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    CharacterDatabase.Execute(
-        "CREATE TABLE IF NOT EXISTS ac_aegis_event ("
-        "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, "
-        "guid INT UNSIGNED NOT NULL, "
-        "account_id INT UNSIGNED NOT NULL DEFAULT 0, "
-        "map_id SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
-        "zone_id SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
-        "area_id SMALLINT UNSIGNED NOT NULL DEFAULT 0, "
-        "cheat_type TINYINT UNSIGNED NOT NULL DEFAULT 0, "
-        "evidence_level TINYINT UNSIGNED NOT NULL DEFAULT 0, "
-        "risk_delta FLOAT NOT NULL DEFAULT 0, "
-        "total_risk_after FLOAT NOT NULL DEFAULT 0, "
-        "evidence_tag VARCHAR(64) NOT NULL DEFAULT '', "
-        "detail_text VARCHAR(255) NOT NULL DEFAULT '', "
-        "pos_x FLOAT NOT NULL DEFAULT 0, "
-        "pos_y FLOAT NOT NULL DEFAULT 0, "
-        "pos_z FLOAT NOT NULL DEFAULT 0, "
-        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-        "PRIMARY KEY (id), "
-        "KEY idx_ac_aegis_event_guid (guid), "
-        "KEY idx_ac_aegis_event_account (account_id), "
-        "KEY idx_ac_aegis_event_cheat (cheat_type), "
-        "KEY idx_ac_aegis_event_created (created_at)"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    static bool warned = false;
+    if (!warned)
+    {
+        warned = true;
+        LOG_WARN("module", "[AcAegis] Runtime schema auto-creation is disabled; apply SQL migrations from modules/mod-ac-aegis/data/sql/db-characters/base/001_ac_aegis_tables.sql");
+    }
 }
 
 bool AcAegisPersistence::LoadOffense(Player* player, AegisOffenseRecord& outRecord) const
@@ -193,34 +338,9 @@ void AcAegisPersistence::SaveOffense(AegisOffenseRecord const& record) const
         banResult);
 }
 
-void AcAegisPersistence::InsertEvent(Player* player, AegisEvidenceEvent const& eventData, float totalRisk) const
+void AcAegisPersistence::QueueEvent(AegisEventRecord const& eventRecord) const
 {
-    if (!player)
-        return;
-
-    std::string tag = EscapeForCharacterDb(eventData.tag);
-    std::string detail = EscapeForCharacterDb(eventData.detail);
-    uint32 accountId = player->GetSession() ? player->GetSession()->GetAccountId() : 0;
-
-    CharacterDatabase.Execute(
-        "INSERT INTO ac_aegis_event (guid, account_id, map_id, zone_id, area_id, "
-        "cheat_type, evidence_level, risk_delta, total_risk_after, evidence_tag, "
-        "detail_text, pos_x, pos_y, pos_z) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, '{}', '{}', {}, {}, {})",
-        player->GetGUID().GetCounter(),
-        accountId,
-        player->GetMapId(),
-        player->GetZoneId(),
-        player->GetAreaId(),
-        static_cast<uint32>(eventData.cheatType),
-        static_cast<uint32>(eventData.level),
-        eventData.riskDelta,
-        totalRisk,
-        tag,
-        detail,
-        player->GetPositionX(),
-        player->GetPositionY(),
-        player->GetPositionZ());
+    GetAsyncEventWriter().Enqueue(eventRecord);
 }
 
 void AcAegisPersistence::DeleteOffense(uint32 guidLow) const
