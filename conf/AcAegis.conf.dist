@@ -1,0 +1,677 @@
+[worldserver]
+
+###################################################################################################
+# mod-ac-aegis 配置说明
+#
+# 目标：
+# - 结合 AzerothCore 自身移动语义、地图几何与渐进式处罚，识别常见外挂与脚本挂机行为。
+# - 当前主要覆盖：速度、传送、穿墙/穿门、非法飞行、爬墙/超级跳、定点挂机采集。
+#
+# 使用建议：
+# - 第一次上线时，建议先保守，优先观察 GM 通知和事件日志，再逐步收紧阈值。
+# - AFK 采集类判定建议结合你服实际采集密度调参，不建议一开始把动作阈值设得过低。
+# - 如果启用 Panel 联动，请填写已有 AGMP 日志文件路径，否则保持关闭。
+#
+# 日志说明：
+# - AcAegis.Log.File.Path 支持自定义路径。
+# - 默认值为 worldserver 当前工作目录下的 ./logs/aegis.log。
+# - 如果目录或文件不存在，模块会在配置加载时自动创建。
+###################################################################################################
+
+###################################################################################################
+# Global / 全局开关
+###################################################################################################
+
+# 是否启用 mod-ac-aegis。
+# 1 = 启用，0 = 禁用。
+AcAegis.Enabled = 1
+
+# 是否对 GM 账号也启用检测。
+# 一般建议保持 0，避免误伤在线排查或人工测试。
+AcAegis.EnabledOnGmAccounts = 0
+
+# 启动或重载配置时，是否自动检查并创建 Aegis 所需数据表。
+AcAegis.Schema.AutoEnsure = 1
+
+###################################################################################################
+# Log / 日志与 GM 通知
+###################################################################################################
+
+# 是否启用 Aegis 自身日志输出。
+# 关闭后将不再写入 aegis.log，也不会写摘要日志。
+AcAegis.Log.Enabled = 1
+
+# 是否启用更详细的内部日志。
+# 开启后，aegis.log 中的 audit 事件会附带更多上下文，
+# 例如安全点、采集窗口统计、最近通知/传送时间等字段。
+AcAegis.Log.Verbose = 0
+
+# 是否定期输出上下文摘要到日志文件。
+AcAegis.Log.Summary.Enabled = 1
+
+# 摘要日志输出间隔，单位毫秒。
+# 默认 60000 即 60 秒输出一次当前在线上下文统计。
+AcAegis.Log.Summary.IntervalMs = 60000
+
+# Aegis 自有日志文件路径。
+# 支持绝对路径和相对路径。
+# 相对路径默认相对于 worldserver 当前工作目录。
+# 默认 ./logs/aegis.log。
+AcAegis.Log.File.Path = ./logs/aegis.log
+
+# GM 通知格式。
+# compact = 简洁格式，适合线上值班。
+# verbose = 详细格式，包含更多人物、坐标、细节字段。
+AcAegis.Log.GmNotify.Format = compact
+
+# 同一玩家同类证据的 GM 通知冷却时间，单位毫秒。
+# 用于避免刷屏。
+AcAegis.Log.GmNotify.CooldownMs = 10000
+
+###################################################################################################
+# Panel Output / 与现有 AGMP 后台日志联动
+###################################################################################################
+
+# 是否启用与 AGMP 日志格式兼容的输出。
+# 启用后，Aegis 会按你现有后台日志习惯写 account_actions.log / character_actions.log。
+AcAegis.Panel.Enabled = 0
+
+# 是否把检测事件也写入 character_actions.log。
+# 1 = 写检测记录，0 = 只写监狱/释放/封禁等结果记录。
+AcAegis.Panel.WriteDetections = 1
+
+# 写入 AGMP 日志时使用的 admin 字段。
+AcAegis.Panel.Admin = AcAegis
+
+# 写入 AGMP 日志时使用的 server 字段。
+AcAegis.Panel.ServerId = 1
+
+# AGMP 账号操作日志文件路径。
+# 例如：G:/PureLand/260312/WWW/AGMP/storage/logs/account_actions.log
+# 留空则不写账号日志。
+AcAegis.Panel.AccountLogPath =
+
+# AGMP 角色操作日志文件路径。
+# 例如：G:/PureLand/260312/WWW/AGMP/storage/logs/character_actions.log
+# 留空则不写角色日志。
+AcAegis.Panel.CharacterLogPath =
+
+# 运动类外挂写入后台日志时的默认 reason 文案。
+AcAegis.Panel.MovementReason = 外挂
+
+# AFK/脚本挂机类写入后台日志时的默认 reason 文案。
+AcAegis.Panel.AfkReason = 挂机
+
+###################################################################################################
+# Sampling / 采样与风险衰减
+###################################################################################################
+
+# 每个玩家保留的移动采样数量。
+# 数值越大，可用于判断的历史越长，但内存占用略高。
+AcAegis.Sampling.BufferSize = 32
+
+# 风险分数半衰期，单位秒。
+# 越大表示风险衰减越慢，历史可疑行为影响持续越久。
+AcAegis.Risk.HalfLifeSeconds = 75
+
+# 单次移动事件允许增加的最大风险值上限。
+# 用于防止某个异常事件把风险一次性拉满。
+AcAegis.Risk.MaxDeltaPerMove = 30
+
+###################################################################################################
+# Accuracy / Grace / 合法状态宽限
+###################################################################################################
+
+# 合法传送后的宽限时间，单位毫秒。
+AcAegis.Accuracy.TeleportGraceMs = 2000
+
+# 换地图后的宽限时间，单位毫秒。
+AcAegis.Accuracy.MapChangeGraceMs = 3000
+
+# 合法位移类技能后的宽限时间，单位毫秒。
+AcAegis.Accuracy.MobilitySpellGraceMs = 1500
+
+# 上下坐骑 / 载具相关宽限时间，单位毫秒。
+AcAegis.Accuracy.VehicleGraceMs = 1500
+
+# 运输工具（船、飞艇、电梯等）相关宽限时间，单位毫秒。
+AcAegis.Accuracy.TransportGraceMs = 2000
+
+# 掉落/下坠宽限时间，单位毫秒。
+AcAegis.Accuracy.FallGraceMs = 800
+
+# 合法位移技能白名单，多个 SpellId 用英文逗号分隔。
+# 这些技能触发后会进入位移宽限期。
+# 常见合法空中位移会按服务端 Aura 类型自动识别，这里主要用于你自定义补充。
+AcAegis.Accuracy.SpellWhitelist =
+
+# 合法移动状态 Aura 白名单，多个 AuraId 用英文逗号分隔。
+# 常见合法空中位移 Aura 会自动识别，这里主要用于你自定义补充。
+AcAegis.Accuracy.AuraWhitelist =
+
+###################################################################################################
+# Detector / Speed / 速度外挂
+###################################################################################################
+
+# 是否启用速度检测。
+AcAegis.Detector.Speed.Enabled = 1
+
+# 速度容忍百分比。
+# 例如 10 表示合法速度基础上再放宽 10%。
+AcAegis.Detector.Speed.TolerancePct = 10
+
+# 固定平移裕量，单位码/秒。
+# 用于减少短时间采样抖动导致的误报。
+AcAegis.Detector.Speed.FlatMargin = 0.75
+
+# 速度检测最小采样间隔，单位毫秒。
+AcAegis.Detector.Speed.MinDtMs = 100
+
+# 速度检测最大采样间隔，单位毫秒。
+# 间隔过长的采样不适合用于严格速度判定。
+AcAegis.Detector.Speed.MaxDtMs = 1500
+
+# 速度异常累计窗口，单位毫秒。
+# 正常行走/坐骑在网络抖动下偶发一次尖峰不应立即判定，窗口内重复命中后才升级。
+AcAegis.Detector.Speed.WindowMs = 1800
+
+# 窗口内命中多少次后，SpeedEnvelope 才作为中等证据成立。
+AcAegis.Detector.Speed.MediumHits = 2
+
+# 窗口内命中多少次后，SpeedEnvelope 才允许升级为强证据。
+AcAegis.Detector.Speed.StrongHits = 3
+
+# 多少倍阈值以上视为强证据。
+AcAegis.Detector.Speed.StrongRatio = 1.6
+
+###################################################################################################
+# Detector / Time / 时间倍率与时基异常
+###################################################################################################
+
+# 是否启用客户端时间倍率检测。
+# 主要用于抓客户端本地时钟明显快于真实时间、试图影响移动时基的外挂。
+AcAegis.Detector.Time.Enabled = 1
+
+# 客户端时间相对服务端最小超前量，单位毫秒。
+AcAegis.Detector.Time.MinClientLeadMs = 180
+
+# 客户端时间流速相对服务端的最小倍率。
+AcAegis.Detector.Time.MinRatio = 1.35
+
+# 只有在发生足够水平位移时才评估时间倍率，单位码。
+AcAegis.Detector.Time.MinDistance2D = 1.25
+
+# 时间倍率异常累计窗口，单位毫秒。
+AcAegis.Detector.Time.WindowMs = 2500
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.Time.StrongHits = 3
+
+###################################################################################################
+# Detector / Teleport / 传送与坐标跳跃
+###################################################################################################
+
+# 是否启用传送检测。
+AcAegis.Detector.Teleport.Enabled = 1
+
+# 最小位移距离，低于该值不按传送判断，单位码。
+AcAegis.Detector.Teleport.MinDistance = 18.0
+
+# 正常速度阈值乘数。
+# 实际观测速度高于 合法速度 * 本值 时进入可疑。
+AcAegis.Detector.Teleport.SpeedMultiplier = 3.0
+
+# 坐标型跳点最小距离，单位码。
+AcAegis.Detector.Teleport.CoordinateMinDistance = 45.0
+
+# 坐标型跳点速度阈值乘数。
+AcAegis.Detector.Teleport.CoordinateSpeedMultiplier = 1.75
+
+# 单轴强跳变阈值，单位码。
+# X/Y/Z 任一方向超过该值，可直接视为强坐标跳点证据。
+AcAegis.Detector.Teleport.AxisStrongDelta = 25.0
+
+# 玩家没有明确移动意图时，仍发生持续 2D 坐标漂移的最小水平位移，单位码。
+# 用来抓外挂反复写 X/Y 坐标、规避大瞬移阈值的“小步推进”。
+AcAegis.Detector.Teleport.StationaryMinDistance2D = 1.25
+
+# 玩家没有明确移动意图时，仍发生坐标漂移的最小 Z 轴变化，单位码。
+AcAegis.Detector.Teleport.StationaryMinDeltaZ = 1.87
+
+# 无移动意图坐标漂移的累计窗口，单位毫秒。
+AcAegis.Detector.Teleport.StationaryWindowMs = 2500
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.Teleport.StationaryStrongHits = 2
+
+# 重复短距突发传送的累计窗口，单位毫秒。
+# 用于抓距离不足 CoordinateMinDistance、但短时间内连续跳点推进的传送外挂。
+AcAegis.Detector.Teleport.BurstWindowMs = 1800
+
+# 窗口内命中多少次后，把 TeleportBurst 升级为强证据。
+AcAegis.Detector.Teleport.BurstStrongHits = 2
+
+###################################################################################################
+# Detector / NoClip / 穿墙穿门
+###################################################################################################
+
+# 是否启用穿墙/穿门检测。
+AcAegis.Detector.NoClip.Enabled = 1
+
+# 几何检测最短间隔，单位毫秒。
+# 防止每个移动包都做 VMAP/MMAP 检测。
+AcAegis.Detector.NoClip.CheckIntervalMs = 300
+
+# 最小线段距离，单位码。
+AcAegis.Detector.NoClip.MinSegmentDistance = 2.5
+
+# 最大直线检测距离，单位码。
+# 太长的位移不适合当成一次穿墙线段处理。
+AcAegis.Detector.NoClip.MaxDirectDistance = 35.0
+
+# 射线检测时的 Z 偏移，单位码。
+AcAegis.Detector.NoClip.RayZOffset = 1.0
+
+# 碰撞后剩余距离阈值，单位码。
+AcAegis.Detector.NoClip.MinRemainingDistance = 0.8
+
+# 只有在速度不离谱时才会把可疑线段交给几何层处理。
+# 这样可以把“高速异常”和“穿墙异常”拆开，减少误报串扰。
+AcAegis.Detector.NoClip.MaxSpeedMultiplier = 1.5
+
+# 微步长穿墙累计窗口，单位毫秒。
+# 用于抓外挂反复写入极小步长坐标，靠累计位移缓慢挤过墙体的行为。
+AcAegis.Detector.NoClip.CumulativeWindowMs = 1800
+
+# 累计穿墙检查最少需要达到的二维位移距离，单位码。
+AcAegis.Detector.NoClip.CumulativeMinDistance = 2.8
+
+# 一个累计窗口内至少命中多少次，才升级为强穿墙证据。
+AcAegis.Detector.NoClip.CumulativeStrongHits = 3
+
+###################################################################################################
+# Detector / Fly / 飞行与滞空
+###################################################################################################
+
+# 是否启用非法飞行检测。
+AcAegis.Detector.Fly.Enabled = 1
+
+# 离地高度阈值，单位码。
+# 玩家在无合法飞行状态下持续高于地面该高度，会被视为可疑。
+AcAegis.Detector.Fly.MinHeightAboveGround = 6.0
+
+# 横向持续移动阈值，单位码。
+# 用于区分单次跳跃与真正悬空滑行。
+AcAegis.Detector.Fly.SustainMinHorizontalDistance = 3.5
+
+# 仅靠非法飞行标记触发 IllegalFlyFlag 时的最小离地高度，单位码。
+# 过低会让贴地抖动或原地转向也被当成飞行标志异常。
+AcAegis.Detector.Fly.IllegalFlagMinHeightAboveGround = 1.0
+
+# 仅靠非法飞行标记触发 IllegalFlyFlag 时的最小水平位移，单位码。
+# 与最小离地高度二选一满足即可进入 IllegalFlyFlag 评估。
+AcAegis.Detector.Fly.IllegalFlagMinHorizontalDistance = 1.0
+
+# 服务端刚授予飞行权限后的宽限时间，单位毫秒。
+AcAegis.Detector.Fly.CanFlyGraceMs = 2500
+
+# 空中悬停判定允许的最大水平位移，单位码。
+# 主要用于抓 FreezeZ / StopFall 这类几乎原地滞空的外挂行为。
+AcAegis.Detector.Fly.AirStallMaxHorizontalDistance = 0.75
+
+# 空中悬停判定允许的最大 Z 轴变化，单位码。
+AcAegis.Detector.Fly.AirStallMaxDeltaZ = 0.15
+
+# 空中悬停累计窗口，单位毫秒。
+AcAegis.Detector.Fly.AirStallWindowMs = 2500
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.Fly.AirStallStrongHits = 3
+
+# 水面行走 / 水下步行异常判定的最小水平位移，单位码。
+# 用于抓外挂关闭游泳物理后沿水面或水下“正常走路”的行为。
+AcAegis.Detector.Fly.WaterWalkMinHorizontalDistance = 1.5
+
+# 判定玩家是否贴着水面行走时允许的最大高度误差，单位码。
+AcAegis.Detector.Fly.WaterWalkSurfaceTolerance = 0.35
+
+# 只有在水深达到该值时才评估水面/水下步行异常，单位码。
+# 这样可以避开浅滩、岸边过渡区等容易误报的位置。
+AcAegis.Detector.Fly.WaterWalkMinWaterDepth = 1.75
+
+# 水面行走 / 水下步行异常累计窗口，单位毫秒。
+AcAegis.Detector.Fly.WaterWalkWindowMs = 2500
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.Fly.WaterWalkStrongHits = 3
+
+###################################################################################################
+# Detector / Mount / 非法坐骑
+###################################################################################################
+
+# 是否启用非法坐骑检测。
+# 覆盖外挂强制室内骑乘，以及地图/副本禁骑时仍保持坐骑状态的行为。
+AcAegis.Detector.Mount.Enabled = 1
+
+# 正常上下马确认后的宽限时间，单位毫秒。
+AcAegis.Detector.Mount.GraceMs = 2500
+
+# 室内骑乘累计窗口，单位毫秒。
+AcAegis.Detector.Mount.IndoorWindowMs = 2500
+
+# 室内骑乘累计窗口内需要命中的最少次数。
+AcAegis.Detector.Mount.IndoorStrongHits = 2
+
+# 室内骑乘每次至少需要满足的二维位移距离，单位码。
+# 用于过滤室内外边缘 outdoors 标记抖动。
+AcAegis.Detector.Mount.IndoorMinMoveDistance = 0.5
+
+###################################################################################################
+# Detector / ForceMove / 受击位移与反击退
+###################################################################################################
+
+# 是否启用受击位移异常检测。
+# 主要覆盖 knockback ACK 已到达，但角色几乎不产生应有位移的反击退行为。
+AcAegis.Detector.ForceMove.Enabled = 1
+
+# 合法击退 ACK 后，通用移动检测跳过的宽限时间，单位毫秒。
+# 用于避免正常 knockback 轨迹误触发速度/飞行/传送类检测。
+AcAegis.Detector.ForceMove.GraceMs = 1200
+
+# 进入受击位移异常评估时，ACK 包要求的最小水平速度。
+AcAegis.Detector.ForceMove.MinAckSpeedXY = 4.0
+
+# 进入受击位移异常评估时，ACK 包要求的最小垂直速度。
+AcAegis.Detector.ForceMove.MinAckSpeedZ = 2.5
+
+# 根据 ACK 速度换算期望位移时使用的折减系数。
+# 数值越低越保守。
+AcAegis.Detector.ForceMove.ExpectedFactor = 0.25
+
+# 判定“几乎未被击退”时要求的最小水平位移阈值，单位码。
+AcAegis.Detector.ForceMove.MinDistance2D = 0.45
+
+# 判定“几乎未被击退”时要求的最小垂直位移阈值，单位码。
+AcAegis.Detector.ForceMove.MinDeltaZ = 0.2
+
+# 受击位移异常累计窗口，单位毫秒。
+AcAegis.Detector.ForceMove.WindowMs = 4000
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.ForceMove.StrongHits = 2
+
+###################################################################################################
+# Detector / Climb and SuperJump / 爬墙与超级跳
+###################################################################################################
+
+# 是否启用爬墙/超级跳检测。
+AcAegis.Detector.Climb.Enabled = 1
+
+# 最小垂直抬升量，单位码。
+AcAegis.Detector.Climb.MinRise = 1.87
+
+# 最小水平位移，单位码。
+AcAegis.Detector.Climb.MinHorizontalDistance = 0.8
+
+# 最小坡度比值。
+# 越大越严格，越容易把陡坡爬升视为异常。
+AcAegis.Detector.Climb.MinSlopeRatio = 1.73
+
+# 爬墙累计窗口，单位毫秒。
+AcAegis.Detector.Climb.WindowMs = 4000
+
+# 窗口内命中多少次后升级为强证据。
+AcAegis.Detector.Climb.StrongHits = 3
+
+# 超级跳离地最高点阈值，单位码。
+AcAegis.Detector.Climb.SuperJumpMinHeight = 8.0
+
+# 超级跳单次 Z 增量阈值，单位码。
+AcAegis.Detector.Climb.SuperJumpMinDeltaZ = 4.0
+
+# 超级跳判定窗口，单位毫秒。
+AcAegis.Detector.Climb.SuperJumpWindowMs = 1200
+
+# 二段跳/无限跳最低离地高度，单位码。
+# 用来过滤正常贴地起跳，只在明显离地后再次收到 jump opcode 时介入。
+AcAegis.Detector.Climb.DoubleJumpMinHeight = 2.5
+
+# 二段跳/无限跳两次 jump opcode 的最大间隔，单位毫秒。
+AcAegis.Detector.Climb.DoubleJumpMaxRepeatMs = 350
+
+###################################################################################################
+# Detector / AFK Gather / 定点挂机采集
+###################################################################################################
+
+# 是否启用 AFK 采集检测。
+AcAegis.Detector.Afk.Enabled = 1
+
+# 统计窗口长度，单位毫秒。
+# 默认 600000 即 10 分钟。
+AcAegis.Detector.Afk.WindowMs = 600000
+
+# 窗口内最少动作数。
+AcAegis.Detector.Afk.MinActions = 12
+
+# 达到该动作数且移动范围更小，会更容易升级为强证据。
+AcAegis.Detector.Afk.StrongActions = 20
+
+# 两次采集/拾取动作的最小间隔，单位毫秒。
+# 小于这个间隔的动作会被忽略，避免瞬时连触发污染统计。
+AcAegis.Detector.Afk.MinActionGapMs = 1500
+
+# 统计窗口内允许的最大移动半径，单位码。
+AcAegis.Detector.Afk.MaxMoveDistance = 6.0
+
+# 强证据要求的更小移动半径，单位码。
+AcAegis.Detector.Afk.StrongMoveDistance = 3.0
+
+# 窗口内最少拾取次数。
+AcAegis.Detector.Afk.MinLootCount = 4
+
+# 窗口内最少采集次数。
+AcAegis.Detector.Afk.MinGatherCount = 6
+
+# 至少要累计多少个可疑窗口，AFK 才允许升级到更重处罚。
+# 用于降低一次性误报带来的踢线/封禁风险。
+AcAegis.Detector.Afk.MinSuspiciousWindows = 2
+
+# AFK 证据冷却时间，单位毫秒。
+AcAegis.Detector.Afk.EvidenceCooldownMs = 300000
+
+# 忽略型动作后的宽限时间，单位毫秒。
+AcAegis.Detector.Afk.IgnoreActionGraceMs = 120000
+
+# AFK 忽略技能白名单。
+AcAegis.Detector.Afk.IgnoreSpellIds =
+
+# AFK 忽略 Aura 白名单。
+AcAegis.Detector.Afk.IgnoreAuras =
+
+###################################################################################################
+# Geometry / 地图几何
+###################################################################################################
+
+# 是否启用几何辅助判断。
+# 建议保持开启，这是穿墙、飞行、爬墙准确率的重要来源。
+AcAegis.Geometry.Enabled = 1
+
+# 是否使用 VMAP。
+AcAegis.Geometry.UseVmaps = 1
+
+# 是否使用 MMAP / 路径系统。
+AcAegis.Geometry.UseMmaps = 1
+
+# 是否允许在热点路径直接做 reachability 检查。
+# 1 会更严格，但 CPU 开销也更高。
+AcAegis.Geometry.AllowHotPathReachability = 0
+
+# 当位移超过该距离时，更倾向走长路径/可达性逻辑，单位码。
+AcAegis.Geometry.LongPathTriggerDistance = 40.0
+
+###################################################################################################
+# Risk Thresholds / 风险阈值
+###################################################################################################
+
+# 达到该风险后通知 GM。
+AcAegis.Risk.NotifyThreshold = 60
+
+# 达到该风险后，如证据建议回滚，则允许自动回滚。
+AcAegis.Risk.RollbackThreshold = 110
+
+# 达到该风险后允许进入 debuff 阶段。
+AcAegis.Risk.DebuffThreshold = 150
+
+# 达到该风险后允许进入监狱阶段。
+AcAegis.Risk.JailThreshold = 210
+
+# 达到该风险后允许踢线。
+AcAegis.Risk.KickThreshold = 260
+
+# 达到该风险后允许封禁。
+AcAegis.Risk.BanThreshold = 320
+
+###################################################################################################
+# Auto Actions / 自动动作
+###################################################################################################
+
+# 是否允许自动回滚到安全点。
+AcAegis.AutoAction.Rollback.Enabled = 1
+
+# 是否允许自动上 debuff。
+AcAegis.AutoAction.Debuff.Enabled = 1
+
+# debuff 法术列表，多个 SpellId 用逗号分隔。
+AcAegis.AutoAction.Debuff.SpellIds = 9454,22856
+
+# 玩家处罚提示间隔，单位毫秒。
+# 对仍处于 debuff / 监禁中的玩家，模块会按该间隔重复提示剩余时间。
+AcAegis.AutoAction.Notify.IntervalMs = 60000
+
+# debuff 刚施加时发送给玩家的提示文案。
+# 可用占位符：{time}
+AcAegis.AutoAction.Notify.DebuffApplyMessage = AcAegis：你已进入减益处罚，剩余时间 {time}。
+
+# debuff 持续期间的定时提示文案。
+# 可用占位符：{time}
+AcAegis.AutoAction.Notify.DebuffRemainMessage = AcAegis：减益处罚剩余 {time}。
+
+# debuff 结束时发送给玩家的提示文案。
+AcAegis.AutoAction.Notify.DebuffExpireMessage = AcAegis：减益处罚已结束。
+
+# 是否允许自动送监。
+AcAegis.AutoAction.Jail.Enabled = 1
+
+# 监狱地图与坐标。
+AcAegis.AutoAction.Jail.MapId = 1
+AcAegis.AutoAction.Jail.X = 16226.5
+AcAegis.AutoAction.Jail.Y = 16403.6
+AcAegis.AutoAction.Jail.Z = -64.5
+AcAegis.AutoAction.Jail.O = 3.2
+
+# 监狱活动半径，单位码。
+# 玩家离开该半径后会被回拉。
+AcAegis.AutoAction.Jail.LeashRadius = 35.0
+
+# 监狱区域回拉检查周期，单位毫秒。
+AcAegis.AutoAction.Jail.ReturnCheckMs = 5000
+
+# 送监时是否同时保留 debuff。
+AcAegis.AutoAction.Jail.KeepDebuff = 1
+
+# 监禁刚施加时发送给玩家的提示文案。
+# 可用占位符：{time}
+AcAegis.AutoAction.Notify.JailApplyMessage = AcAegis：你已被送入监狱，剩余时间 {time}。
+
+# 监禁持续期间的定时提示文案。
+# 可用占位符：{time}
+AcAegis.AutoAction.Notify.JailRemainMessage = AcAegis：监禁剩余 {time}。
+
+# 监禁结束时发送给玩家的提示文案。
+AcAegis.AutoAction.Notify.JailExpireMessage = AcAegis：监禁处罚已结束，你已被释放。
+
+# 释放点地图与坐标。
+AcAegis.AutoAction.Release.MapId = 530
+AcAegis.AutoAction.Release.X = -1887.62
+AcAegis.AutoAction.Release.Y = 5359.09
+AcAegis.AutoAction.Release.Z = -12.43
+AcAegis.AutoAction.Release.O = 2.04
+
+# 出狱后剩余风险保留比例。
+# 0.35 表示出狱后仅保留 35% 当前风险。
+AcAegis.AutoAction.Release.RiskFactor = 0.35
+
+# 是否允许自动踢线。
+AcAegis.AutoAction.Kick.Enabled = 1
+
+# 是否允许自动封禁。
+AcAegis.AutoAction.Ban.Enabled = 1
+
+# 封禁模式。
+# character = 封角色
+# account = 封账号名
+# account-by-character = 通过角色名反查账号并封号，推荐默认值
+AcAegis.AutoAction.Ban.Mode = account-by-character
+
+# 是否要求“强证据”才能进入封禁阶段。
+AcAegis.AutoAction.Ban.StrongEvidenceRequired = 1
+
+# 至少多少次 offense 后才允许封禁。
+AcAegis.AutoAction.Ban.MinOffenseCount = 2
+
+# 阶段 3 封禁天数。
+AcAegis.AutoAction.Ban.Stage3Days = 3
+
+# 阶段 4 封禁天数。
+AcAegis.AutoAction.Ban.Stage4Days = 30
+
+# 到达多少 offense tier 后进入永久封禁。
+AcAegis.AutoAction.Ban.PermanentTier = 5
+
+# 永久封禁时传给 BanMgr 的持续时间 token。
+# AzerothCore 常用 0 表示永久。
+AcAegis.AutoAction.Ban.PermanentDurationToken = 0
+
+# 封禁原因模板。
+# 可用占位符：{type} {tier} {offense} {risk}
+AcAegis.AutoAction.Ban.ReasonTemplate = AcAegis:{type}:tier={tier}:offense={offense}:risk={risk}
+
+# 封禁执行者显示名称。
+AcAegis.AutoAction.Ban.Author = AcAegis
+
+###################################################################################################
+# Offense / 持久化累犯策略
+###################################################################################################
+
+# 是否启用 offense 累犯系统。
+AcAegis.Offense.Enabled = 1
+
+# 是否只在实际处罚发生时才累计 offense。
+# 建议保持 1，避免仅有观察级别事件也把 offense 拉高。
+AcAegis.Offense.CountOnlyOnPunish = 1
+
+# offense 衰减窗口，单位天。
+AcAegis.Offense.DecayDays = 90
+
+# offense 衰减模式。
+# slow-tier-decay = 缓慢降 tier
+# hard-reset = 到期后清零
+AcAegis.Offense.DecayMode = slow-tier-decay
+
+# offense 最大 tier。
+AcAegis.Offense.MaxTier = 5
+
+# Stage1 debuff 持续秒数。
+AcAegis.Offense.Stage1DebuffSeconds = 86400
+
+# Stage2 监狱持续秒数。
+AcAegis.Offense.Stage2JailSeconds = 7200
+
+# Stage3 封禁天数。
+AcAegis.Offense.Stage3BanDays = 3
+
+# Stage4 封禁天数。
+AcAegis.Offense.Stage4BanDays = 30
+
+# Stage5 是否永久封禁。
+AcAegis.Offense.Stage5Permanent = 1
