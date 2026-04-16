@@ -39,6 +39,12 @@ namespace
         outRecord.lastBanResult = field[13].Get<std::string>();
     }
 
+    struct QueuedEventRecord
+    {
+        uint64 sequence = 0;
+        AegisEventRecord eventRecord;
+    };
+
     class AsyncEventWriter
     {
     public:
@@ -51,20 +57,56 @@ namespace
 
         void Enqueue(AegisEventRecord const& eventRecord)
         {
-            AegisConfig const& cfg = sAcAegisConfig->Get();
-
             {
                 std::lock_guard<std::mutex> lock(_mutex);
-                if (_queue.size() >= cfg.eventQueueLimit)
+                if (_queue.size() >= sAcAegisConfig->GetEventQueueLimit())
                 {
                     ++_droppedCount;
                     return;
                 }
 
-                _queue.push_back(eventRecord);
+                QueuedEventRecord queuedEvent;
+                queuedEvent.sequence = ++_nextSequence;
+                queuedEvent.eventRecord = eventRecord;
+                _queue.push_back(std::move(queuedEvent));
             }
 
             _condition.notify_one();
+        }
+
+        void Barrier()
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            uint64 targetSequence = _nextSequence;
+            if (targetSequence == 0 || _completedSequence >= targetSequence)
+                return;
+
+            if (targetSequence > _flushTargetSequence)
+                _flushTargetSequence = targetSequence;
+
+            _condition.notify_one();
+            _condition.wait(lock, [this, targetSequence]()
+            {
+                return _completedSequence >= targetSequence;
+            });
+        }
+
+        void DropQueuedForGuid(uint32 guidLow)
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            for (auto it = _queue.begin(); it != _queue.end();)
+            {
+                if (it->eventRecord.guid == guidLow)
+                    it = _queue.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        void DropAllQueued()
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _queue.clear();
         }
 
     private:
@@ -87,17 +129,18 @@ namespace
         {
             for (;;)
             {
-                std::vector<AegisEventRecord> batch;
+                std::vector<QueuedEventRecord> batch;
 
                 {
                     std::unique_lock<std::mutex> lock(_mutex);
-                    uint32 flushMs = sAcAegisConfig->Get().eventFlushIntervalMs;
-                    uint32 batchSize = sAcAegisConfig->Get().eventBatchSize;
+                    uint32 flushMs = sAcAegisConfig->GetEventFlushIntervalMs();
+                    uint32 batchSize = sAcAegisConfig->GetEventBatchSize();
                     _condition.wait_for(lock,
                         std::chrono::milliseconds(flushMs),
                         [this, batchSize]()
                         {
-                            return _stopping || _queue.size() >= batchSize;
+                            return _stopping || _queue.size() >= batchSize ||
+                                (_flushTargetSequence != 0 && !_queue.empty());
                         });
 
                     if (!_queue.empty())
@@ -108,29 +151,34 @@ namespace
                 }
 
                 if (!batch.empty())
+                {
                     FlushBatch(batch);
+                    CompleteBatch(batch);
+                }
 
                 MaybeLogDropped();
             }
 
-            std::vector<AegisEventRecord> remaining;
+            std::vector<QueuedEventRecord> remaining;
             for (;;)
             {
                 {
                     std::lock_guard<std::mutex> lock(_mutex);
-                    DrainBatch(remaining, sAcAegisConfig->Get().eventBatchSize);
+                    DrainBatch(remaining,
+                        sAcAegisConfig->GetEventBatchSize());
                 }
 
                 if (remaining.empty())
                     break;
 
                 FlushBatch(remaining);
+                CompleteBatch(remaining);
             }
 
             MaybeLogDropped(true);
         }
 
-        void DrainBatch(std::vector<AegisEventRecord>& outBatch, size_t limit)
+        void DrainBatch(std::vector<QueuedEventRecord>& outBatch, size_t limit)
         {
             outBatch.clear();
             limit = std::max<size_t>(1, limit);
@@ -142,7 +190,7 @@ namespace
             }
         }
 
-        void FlushBatch(std::vector<AegisEventRecord> const& batch)
+        void FlushBatch(std::vector<QueuedEventRecord> const& batch)
         {
             if (batch.empty())
                 return;
@@ -157,25 +205,40 @@ namespace
                 if (index > 0)
                     sql << ',';
 
-                std::string tag = EscapeForCharacterDb(batch[index].evidenceTag);
-                std::string detail = EscapeForCharacterDb(batch[index].detailText);
-                sql << '(' << batch[index].guid
-                    << ',' << batch[index].accountId
-                    << ',' << batch[index].mapId
-                    << ',' << batch[index].zoneId
-                    << ',' << batch[index].areaId
-                    << ',' << static_cast<uint32>(batch[index].cheatType)
-                    << ',' << static_cast<uint32>(batch[index].evidenceLevel)
-                    << ',' << batch[index].riskDelta
-                    << ',' << batch[index].totalRiskAfter
+                AegisEventRecord const& eventRecord = batch[index].eventRecord;
+                std::string tag = EscapeForCharacterDb(eventRecord.evidenceTag);
+                std::string detail = EscapeForCharacterDb(eventRecord.detailText);
+                sql << '(' << eventRecord.guid
+                    << ',' << eventRecord.accountId
+                    << ',' << eventRecord.mapId
+                    << ',' << eventRecord.zoneId
+                    << ',' << eventRecord.areaId
+                    << ',' << static_cast<uint32>(eventRecord.cheatType)
+                    << ',' << static_cast<uint32>(eventRecord.evidenceLevel)
+                    << ',' << eventRecord.riskDelta
+                    << ',' << eventRecord.totalRiskAfter
                     << ", '" << tag << "', '" << detail << "', "
-                    << batch[index].posX
-                    << ',' << batch[index].posY
-                    << ',' << batch[index].posZ
+                    << eventRecord.posX
+                    << ',' << eventRecord.posY
+                    << ',' << eventRecord.posZ
                     << ')';
             }
 
             CharacterDatabase.DirectExecute(sql.str());
+        }
+
+        void CompleteBatch(std::vector<QueuedEventRecord> const& batch)
+        {
+            if (batch.empty())
+                return;
+
+            std::lock_guard<std::mutex> lock(_mutex);
+            _completedSequence = std::max(_completedSequence,
+                batch.back().sequence);
+            if (_flushTargetSequence != 0 &&
+                _completedSequence >= _flushTargetSequence)
+                _flushTargetSequence = 0;
+            _condition.notify_all();
         }
 
         void MaybeLogDropped(bool force = false)
@@ -202,10 +265,13 @@ namespace
     private:
         std::mutex _mutex;
         std::condition_variable _condition;
-        std::deque<AegisEventRecord> _queue;
+        std::deque<QueuedEventRecord> _queue;
         std::thread _worker;
         std::chrono::steady_clock::time_point _lastDropLogAt = std::chrono::steady_clock::now();
         uint32 _droppedCount = 0;
+        uint64 _nextSequence = 0;
+        uint64 _completedSequence = 0;
+        uint64 _flushTargetSequence = 0;
         bool _stopping = false;
     };
 
@@ -352,6 +418,8 @@ void AcAegisPersistence::DeleteOffense(uint32 guidLow) const
 
 void AcAegisPersistence::DeletePlayerData(uint32 guidLow) const
 {
+    GetAsyncEventWriter().Barrier();
+    GetAsyncEventWriter().DropQueuedForGuid(guidLow);
     CharacterDatabase.Execute(
         "DELETE FROM ac_aegis_event WHERE guid = {}",
         guidLow);
@@ -360,6 +428,8 @@ void AcAegisPersistence::DeletePlayerData(uint32 guidLow) const
 
 void AcAegisPersistence::PurgeAllData() const
 {
+    GetAsyncEventWriter().Barrier();
+    GetAsyncEventWriter().DropAllQueued();
     CharacterDatabase.Execute("TRUNCATE TABLE ac_aegis_event");
     CharacterDatabase.Execute("TRUNCATE TABLE ac_aegis_offense");
 }

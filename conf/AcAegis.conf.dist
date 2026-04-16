@@ -138,6 +138,16 @@ AcAegis.Risk.MaxDeltaPerMove = 30
 # 合法传送后的宽限时间，单位毫秒。
 AcAegis.Accuracy.TeleportGraceMs = 2000
 
+# 合法传送后的“到达确认”窗口，单位毫秒。
+# 在这个窗口内，如果玩家第一条移动样本落在服务端传送目标点附近，
+# 则会重新打上传送宽限，避免炉石、法师传送门、术士召唤、集合石、LFG 进出本
+# 等正常传送因为加载或同图跳点而被误判为 CoordinateTeleport。
+AcAegis.Accuracy.TeleportArrivalWindowMs = 15000
+
+# 传送到达确认半径，单位码。
+# 玩家在目标点附近首次恢复移动时，会被视为合法传送落点。
+AcAegis.Accuracy.TeleportArrivalRadius = 40.0
+
 # 换地图后的宽限时间，单位毫秒。
 AcAegis.Accuracy.MapChangeGraceMs = 3000
 
@@ -244,18 +254,18 @@ AcAegis.Detector.Teleport.CoordinateSpeedMultiplier = 1.75
 # X/Y/Z 任一方向超过该值，可直接视为强坐标跳点证据。
 AcAegis.Detector.Teleport.AxisStrongDelta = 25.0
 
-# 玩家没有明确移动意图时，仍发生持续 2D 坐标漂移的最小水平位移，单位码。
-# 用来抓外挂反复写 X/Y 坐标、规避大瞬移阈值的“小步推进”。
-AcAegis.Detector.Teleport.StationaryMinDistance2D = 1.25
+# 玩家连续两帧都没有明确移动意图时，仍发生持续 2D 坐标漂移的最小水平位移，单位码。
+# 用来抓外挂反复写 X/Y 坐标、规避大瞬移阈值的“小步推进”，默认值故意保守，避免误伤主城正常横移和停走切换。
+AcAegis.Detector.Teleport.StationaryMinDistance2D = 4.5
 
-# 玩家没有明确移动意图时，仍发生坐标漂移的最小 Z 轴变化，单位码。
-AcAegis.Detector.Teleport.StationaryMinDeltaZ = 1.87
+# 玩家连续两帧都没有明确移动意图时，仍发生坐标漂移的最小 Z 轴变化，单位码。
+AcAegis.Detector.Teleport.StationaryMinDeltaZ = 3.0
 
 # 无移动意图坐标漂移的累计窗口，单位毫秒。
 AcAegis.Detector.Teleport.StationaryWindowMs = 2500
 
 # 窗口内命中多少次后升级为强证据。
-AcAegis.Detector.Teleport.StationaryStrongHits = 2
+AcAegis.Detector.Teleport.StationaryStrongHits = 3
 
 # 重复短距突发传送的累计窗口，单位毫秒。
 # 用于抓距离不足 CoordinateMinDistance、但短时间内连续跳点推进的传送外挂。
@@ -451,6 +461,14 @@ AcAegis.Detector.Climb.DoubleJumpMinHeight = 2.5
 
 # 二段跳/无限跳两次 jump opcode 的最大间隔，单位毫秒。
 AcAegis.Detector.Climb.DoubleJumpMaxRepeatMs = 350
+
+# 二段跳/无限跳累计窗口，单位毫秒。
+# 只有在这个窗口内多次出现“明显离地后的快速重复 jump opcode”，才会升级为证据。
+AcAegis.Detector.Climb.DoubleJumpWindowMs = 1200
+
+# 二段跳/无限跳累计窗口内要求的最少命中次数。
+# 提高该值可以进一步减少副本平台、边缘抬升、网络抖动带来的误报。
+AcAegis.Detector.Climb.DoubleJumpRepeatHits = 2
 
 ###################################################################################################
 # Detector / AFK Gather / 定点挂机采集
@@ -685,12 +703,6 @@ AcAegis.Offense.Stage1DebuffSeconds = 86400
 
 # Stage2 监狱持续秒数。
 AcAegis.Offense.Stage2JailSeconds = 7200
-
-# Stage3 封禁天数。
-AcAegis.Offense.Stage3BanDays = 3
-
-# Stage4 封禁天数。
-AcAegis.Offense.Stage4BanDays = 30
 
 # Stage5 是否永久封禁。
 AcAegis.Offense.Stage5Permanent = 1

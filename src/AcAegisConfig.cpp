@@ -85,6 +85,8 @@ void AcAegisConfig::Reload()
     _config.riskMaxDeltaPerMove = sConfigMgr->GetOption<float>("AcAegis.Risk.MaxDeltaPerMove", 30.0f);
 
     _config.teleportGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportGraceMs", 2000);
+    _config.teleportArrivalWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportArrivalWindowMs", 15000);
+    _config.teleportArrivalRadius = sConfigMgr->GetOption<float>("AcAegis.Accuracy.TeleportArrivalRadius", 40.0f);
     _config.mapChangeGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.MapChangeGraceMs", 3000);
     _config.mobilitySpellGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.MobilitySpellGraceMs", 1500);
     _config.vehicleGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.VehicleGraceMs", 1500);
@@ -116,10 +118,10 @@ void AcAegisConfig::Reload()
     _config.teleportCoordinateMinDistance = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.CoordinateMinDistance", 45.0f);
     _config.teleportCoordinateSpeedMultiplier = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.CoordinateSpeedMultiplier", 1.75f);
     _config.teleportAxisStrongDelta = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.AxisStrongDelta", 25.0f);
-    _config.teleportStationaryMinDistance2D = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.StationaryMinDistance2D", 1.25f);
-    _config.teleportStationaryMinDeltaZ = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.StationaryMinDeltaZ", 1.87f);
+    _config.teleportStationaryMinDistance2D = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.StationaryMinDistance2D", 4.5f);
+    _config.teleportStationaryMinDeltaZ = sConfigMgr->GetOption<float>("AcAegis.Detector.Teleport.StationaryMinDeltaZ", 3.0f);
     _config.teleportStationaryWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Teleport.StationaryWindowMs", 2500);
-    _config.teleportStationaryStrongHits = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Teleport.StationaryStrongHits", 2);
+    _config.teleportStationaryStrongHits = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Teleport.StationaryStrongHits", 3);
     _config.teleportBurstWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Teleport.BurstWindowMs", 1800);
     _config.teleportBurstStrongHits = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Teleport.BurstStrongHits", 2);
 
@@ -177,6 +179,8 @@ void AcAegisConfig::Reload()
     _config.superJumpWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Climb.SuperJumpWindowMs", 1200);
     _config.doubleJumpMinHeight = sConfigMgr->GetOption<float>("AcAegis.Detector.Climb.DoubleJumpMinHeight", 2.5f);
     _config.doubleJumpMaxRepeatMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Climb.DoubleJumpMaxRepeatMs", 350);
+    _config.doubleJumpWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Climb.DoubleJumpWindowMs", 1200);
+    _config.doubleJumpRepeatHits = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Climb.DoubleJumpRepeatHits", 2);
 
     _config.afkEnabled = sConfigMgr->GetOption<bool>("AcAegis.Detector.Afk.Enabled", true);
     _config.afkWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Afk.WindowMs", 600000);
@@ -240,8 +244,10 @@ void AcAegisConfig::Reload()
     _config.banMode = SanitizeLower(sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Ban.Mode", "account-by-character"));
     _config.banStrongEvidenceRequired = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Ban.StrongEvidenceRequired", true);
     _config.banMinOffenseCount = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.MinOffenseCount", 2);
-    _config.banStage3Days = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.Stage3Days", 3);
-    _config.banStage4Days = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.Stage4Days", 30);
+    _config.banStage3Days = sConfigMgr->GetOption<uint32>(
+        "AcAegis.AutoAction.Ban.Stage3Days", 3);
+    _config.banStage4Days = sConfigMgr->GetOption<uint32>(
+        "AcAegis.AutoAction.Ban.Stage4Days", 30);
     _config.banPermanentTier = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.PermanentTier", 5);
     _config.banPermanentDurationToken = sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Ban.PermanentDurationToken", "0");
     _config.banReasonTemplate = sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Ban.ReasonTemplate", "AcAegis:{type}:tier={tier}:offense={offense}:risk={risk}");
@@ -254,8 +260,6 @@ void AcAegisConfig::Reload()
     _config.offenseMaxTier = sConfigMgr->GetOption<uint32>("AcAegis.Offense.MaxTier", 5);
     _config.stage1DebuffSeconds = sConfigMgr->GetOption<uint32>("AcAegis.Offense.Stage1DebuffSeconds", 86400);
     _config.stage2JailSeconds = sConfigMgr->GetOption<uint32>("AcAegis.Offense.Stage2JailSeconds", 7200);
-    _config.stage3BanDays = sConfigMgr->GetOption<uint32>("AcAegis.Offense.Stage3BanDays", 3);
-    _config.stage4BanDays = sConfigMgr->GetOption<uint32>("AcAegis.Offense.Stage4BanDays", 30);
     _config.stage5Permanent = sConfigMgr->GetOption<bool>("AcAegis.Offense.Stage5Permanent", true);
 
     _config.samplingBufferSize = std::clamp<uint32>(_config.samplingBufferSize, 2, 256);
@@ -283,6 +287,8 @@ void AcAegisConfig::Reload()
     _config.timeStrongHits = std::max<uint32>(1, _config.timeStrongHits);
 
     _config.teleportMinDistance = std::max(0.0f, _config.teleportMinDistance);
+    _config.teleportArrivalWindowMs = std::max<uint32>(_config.teleportGraceMs, _config.teleportArrivalWindowMs);
+    _config.teleportArrivalRadius = std::max(1.0f, _config.teleportArrivalRadius);
     _config.teleportSpeedMultiplier = std::max(1.0f, _config.teleportSpeedMultiplier);
     _config.teleportCoordinateMinDistance = std::max(_config.teleportMinDistance, _config.teleportCoordinateMinDistance);
     _config.teleportCoordinateSpeedMultiplier = std::max(1.0f, _config.teleportCoordinateSpeedMultiplier);
@@ -343,6 +349,8 @@ void AcAegisConfig::Reload()
     _config.superJumpWindowMs = std::max<uint32>(100, _config.superJumpWindowMs);
     _config.doubleJumpMinHeight = std::max(0.5f, _config.doubleJumpMinHeight);
     _config.doubleJumpMaxRepeatMs = std::max<uint32>(50, _config.doubleJumpMaxRepeatMs);
+    _config.doubleJumpWindowMs = std::max<uint32>(_config.doubleJumpMaxRepeatMs, _config.doubleJumpWindowMs);
+    _config.doubleJumpRepeatHits = std::max<uint32>(1, _config.doubleJumpRepeatHits);
 
     _config.afkWindowMs = std::max<uint32>(60000, _config.afkWindowMs);
     _config.afkMinActions = std::max<uint32>(2, _config.afkMinActions);
@@ -377,11 +385,29 @@ void AcAegisConfig::Reload()
     _config.offenseMaxTier = std::clamp<uint32>(_config.offenseMaxTier, 1, 10);
     _config.stage1DebuffSeconds = std::max<uint32>(1, _config.stage1DebuffSeconds);
     _config.stage2JailSeconds = std::max<uint32>(1, _config.stage2JailSeconds);
-    _config.stage3BanDays = std::max<uint32>(1, _config.stage3BanDays);
-    _config.stage4BanDays = std::max(_config.stage3BanDays, _config.stage4BanDays);
+    _eventBatchSize.store(_config.eventBatchSize, std::memory_order_relaxed);
+    _eventFlushIntervalMs.store(_config.eventFlushIntervalMs,
+        std::memory_order_relaxed);
+    _eventQueueLimit.store(_config.eventQueueLimit,
+        std::memory_order_relaxed);
 }
 
 AegisConfig const& AcAegisConfig::Get() const
 {
     return _config;
+}
+
+uint32 AcAegisConfig::GetEventBatchSize() const
+{
+    return _eventBatchSize.load(std::memory_order_relaxed);
+}
+
+uint32 AcAegisConfig::GetEventFlushIntervalMs() const
+{
+    return _eventFlushIntervalMs.load(std::memory_order_relaxed);
+}
+
+uint32 AcAegisConfig::GetEventQueueLimit() const
+{
+    return _eventQueueLimit.load(std::memory_order_relaxed);
 }

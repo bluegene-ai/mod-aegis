@@ -239,7 +239,7 @@ public:
         else
             sAcAegisMgr->ClearPlayerOffense(player->GetGUID().GetCounter());
 
-        handler->PSendSysMessage("AcAegis 已清空玩家 {} 的 offense，移除减益并重置至释放点。", player->GetName());
+        handler->PSendSysMessage("AcAegis 已清空玩家 {} 的 offense 与在线检测状态，保留 event 历史。", player->GetName());
         return true;
     }
 
@@ -250,14 +250,14 @@ public:
             return false;
 
         sAcAegisMgr->DeletePlayerData(player->GetGUID().GetCounter());
-        handler->PSendSysMessage("AcAegis 已清理玩家 {} 的在线状态和数据库记录。", player->GetName());
+        handler->PSendSysMessage("AcAegis 已删除玩家 {} 的 offense 与 event 记录，并移除在线上下文。", player->GetName());
         return true;
     }
 
     static bool HandlePurgeCommand(ChatHandler* handler)
     {
         sAcAegisMgr->PurgeAllData();
-        handler->PSendSysMessage("AcAegis 已清空全部 offense/event 数据和内存状态。");
+        handler->PSendSysMessage("AcAegis 已清空全部 offense/event 数据和内存状态；后续新证据仍会重新生成记录。");
         return true;
     }
 
@@ -406,24 +406,6 @@ public:
     }
 };
 
-class AcAegisTransportScript : public TransportScript
-{
-public:
-    AcAegisTransportScript() : TransportScript("AcAegisTransportScript")
-    {
-    }
-
-    void OnAddPassenger(Transport* /*transport*/, Player* player) override
-    {
-        sAcAegisMgr->OnTransportTransition(player);
-    }
-
-    void OnRemovePassenger(Transport* /*transport*/, Player* player) override
-    {
-        sAcAegisMgr->OnTransportTransition(player);
-    }
-};
-
 class AcAegisWorldScript : public WorldScript
 {
 public:
@@ -452,6 +434,5 @@ void startAcAegisScripts()
     new AcAegisPlayerScript();
     new AcAegisMovementHandlerScript();
     new AcAegisVehicleScript();
-    new AcAegisTransportScript();
     AddSC_acaegis_commandscript();
 }

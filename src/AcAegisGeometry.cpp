@@ -24,13 +24,24 @@ namespace
 
 bool AcAegisGeometry::GetGroundHeight(Player* player, float x, float y, float z, float& groundZ) const
 {
-    if (!player || !player->GetMap())
+    Map* map = player ? player->GetMap() : nullptr;
+    if (!player || !player->IsInWorld() || !map)
     {
         groundZ = z;
         return false;
     }
 
-    groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z);
+    PositionFullTerrainStatus terrainStatus;
+    map->GetFullTerrainStatusForPosition(player->GetPhaseMask(),
+        x, y, z, player->GetCollisionHeight(), terrainStatus);
+
+    if (terrainStatus.floorZ > INVALID_HEIGHT)
+    {
+        groundZ = terrainStatus.floorZ;
+        return true;
+    }
+
+    groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z);
     return groundZ > INVALID_HEIGHT;
 }
 
@@ -39,14 +50,15 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
     float endX, float endY, float endZ,
     float& hitX, float& hitY, float& hitZ) const
 {
-    if (!player || !player->GetMap())
+    Map* map = player ? player->GetMap() : nullptr;
+    if (!player || !player->IsInWorld() || !map)
         return false;
 
     LineOfSightChecks checks = LINEOFSIGHT_CHECK_GOBJECT_ALL;
     if (sAcAegisConfig->Get().useVmaps)
         checks = LineOfSightChecks(checks | LINEOFSIGHT_CHECK_VMAP);
 
-    bool clear = player->GetMap()->isInLineOfSight(
+    bool clear = map->isInLineOfSight(
         startX, startY, startZ,
         endX, endY, endZ,
         player->GetPhaseMask(),
@@ -89,12 +101,13 @@ AegisGeometryResult AcAegisGeometry::CheckShortSegment(Player* player,
     bool rayBlocked = blocked && remainingDistance >= cfg.noClipMinRemainingDistance;
 
     bool reachable = true;
-    if (allowReachability && player && player->GetMap())
+    Map* map = (player && player->IsInWorld()) ? player->GetMap() : nullptr;
+    if (allowReachability && player && map)
     {
         float rx = to.x;
         float ry = to.y;
         float rz = to.z;
-        reachable = player->GetMap()->CanReachPositionAndGetValidCoords(
+        reachable = map->CanReachPositionAndGetValidCoords(
             player,
             from.x, from.y, from.z,
             rx, ry, rz,

@@ -203,6 +203,12 @@ struct AegisPlayerContext
 
     uint32 lastSpellGraceMs = 0;
     uint32 lastTeleportMs = 0;
+    uint32 lastAuthorizedAerialMs = 0;
+    uint32 pendingTeleportExpireMs = 0;
+    uint32 pendingTeleportMapId = 0;
+    float pendingTeleportX = 0.0f;
+    float pendingTeleportY = 0.0f;
+    float pendingTeleportZ = 0.0f;
     uint32 lastMapChangeMs = 0;
     uint32 lastVehicleMs = 0;
     uint32 lastTransportMs = 0;
@@ -221,6 +227,10 @@ struct AegisPlayerContext
     uint32 lastJailReturnCheckMs = 0;
     uint32 lastPunishNotifyMs = 0;
     bool serverCanFly = false;
+    bool observedAuthorizedAerialState = false;
+    bool observedTaxiFlightState = false;
+    bool observedTransportState = false;
+    bool observedVehicleState = false;
 
     AegisControlledMoveKind controlledMoveKind = AegisControlledMoveKind::None;
     uint32 controlledMoveIssuedMs = 0;
@@ -252,10 +262,14 @@ struct AegisPlayerContext
     uint32 climbHitsInWindow = 0;
     uint32 superJumpWindowStartMs = 0;
     uint32 superJumpHitsInWindow = 0;
+    uint32 doubleJumpWindowStartMs = 0;
+    uint32 doubleJumpHits = 0;
     uint32 stationaryMoveWindowStartMs = 0;
     uint32 stationaryMoveHits = 0;
     uint32 teleportBurstWindowStartMs = 0;
     uint32 teleportBurstHits = 0;
+    uint32 transportSpeedWindowStartMs = 0;
+    uint32 transportSpeedHits = 0;
 
     AegisGatherState gather;
     AegisPunishState punish;

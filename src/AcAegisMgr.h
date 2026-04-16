@@ -49,6 +49,7 @@ struct AegisMovementContext
     bool recentServerCanFly = false;
     bool recentMountAck = false;
     bool recentMountGrace = false;
+    bool recentAerialExitGrace = false;
     bool recentJump = false;
     bool recentExtendedJump = false;
     bool recentFall = false;
@@ -80,7 +81,6 @@ public:
     void OnCanFlyByServer(Player* player, bool apply);
     void OnUnderAckMount(Player* player);
     void OnVehicleTransition(Player* player);
-    void OnTransportTransition(Player* player);
     void OnRootAckUpd(Player* player);
     void OnJumpOpcode(Player* player, bool jump);
     void OnMovementInfoUpdate(Player* player, MovementInfo const& movementInfo);

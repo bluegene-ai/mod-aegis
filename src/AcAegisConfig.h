@@ -1,6 +1,7 @@
 #ifndef MOD_AC_AEGIS_CONFIG_H
 #define MOD_AC_AEGIS_CONFIG_H
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,8 @@ struct AegisConfig
     float riskMaxDeltaPerMove = 30.0f;
 
     uint32 teleportGraceMs = 2000;
+    uint32 teleportArrivalWindowMs = 15000;
+    float teleportArrivalRadius = 40.0f;
     uint32 mapChangeGraceMs = 3000;
     uint32 mobilitySpellGraceMs = 1500;
     uint32 vehicleGraceMs = 1500;
@@ -68,10 +71,10 @@ struct AegisConfig
     float teleportCoordinateMinDistance = 45.0f;
     float teleportCoordinateSpeedMultiplier = 1.75f;
     float teleportAxisStrongDelta = 25.0f;
-    float teleportStationaryMinDistance2D = 1.25f;
-    float teleportStationaryMinDeltaZ = 1.87f;
+    float teleportStationaryMinDistance2D = 4.5f;
+    float teleportStationaryMinDeltaZ = 3.0f;
     uint32 teleportStationaryWindowMs = 2500;
-    uint32 teleportStationaryStrongHits = 2;
+    uint32 teleportStationaryStrongHits = 3;
     uint32 teleportBurstWindowMs = 1800;
     uint32 teleportBurstStrongHits = 2;
 
@@ -129,6 +132,8 @@ struct AegisConfig
     uint32 superJumpWindowMs = 1200;
     float doubleJumpMinHeight = 2.5f;
     uint32 doubleJumpMaxRepeatMs = 350;
+    uint32 doubleJumpWindowMs = 1200;
+    uint32 doubleJumpRepeatHits = 2;
 
     bool afkEnabled = true;
     uint32 afkWindowMs = 600000;
@@ -206,8 +211,6 @@ struct AegisConfig
     uint32 offenseMaxTier = 5;
     uint32 stage1DebuffSeconds = 86400;
     uint32 stage2JailSeconds = 7200;
-    uint32 stage3BanDays = 3;
-    uint32 stage4BanDays = 30;
     bool stage5Permanent = true;
 };
 
@@ -218,9 +221,15 @@ public:
 
     void Reload();
     AegisConfig const& Get() const;
+    uint32 GetEventBatchSize() const;
+    uint32 GetEventFlushIntervalMs() const;
+    uint32 GetEventQueueLimit() const;
 
 private:
     AegisConfig _config;
+    std::atomic<uint32> _eventBatchSize{32};
+    std::atomic<uint32> _eventFlushIntervalMs{1000};
+    std::atomic<uint32> _eventQueueLimit{4096};
 };
 
 #define sAcAegisConfig AcAegisConfig::instance()

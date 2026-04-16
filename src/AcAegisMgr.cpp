@@ -229,6 +229,23 @@ namespace
         return shouldRollback || stage != AegisPunishStage::Observe;
     }
 
+    bool PersistentPunishStateChanged(AegisPunishState const& before,
+        AegisPunishState const& after)
+    {
+        return before.offenseCount != after.offenseCount ||
+            before.offenseTier != after.offenseTier ||
+            before.punishStage != after.punishStage ||
+            before.debuffUntilEpoch != after.debuffUntilEpoch ||
+            before.jailUntilEpoch != after.jailUntilEpoch ||
+            before.banUntilEpoch != after.banUntilEpoch ||
+            before.lastOffenseEpoch != after.lastOffenseEpoch ||
+            before.permanentBan != after.permanentBan ||
+            before.lastCheatType != after.lastCheatType ||
+            before.lastReason != after.lastReason ||
+            before.lastBanMode != after.lastBanMode ||
+            before.lastBanResult != after.lastBanResult;
+    }
+
     char const* CheatTypeText(AegisCheatType type)
     {
         switch (type)
@@ -473,6 +490,33 @@ namespace
         return static_cast<AegisPunishStage>(targetRank);
     }
 
+    AegisPunishStage RiskThresholdStage(float risk,
+        AegisConfig const& cfg)
+    {
+        if (risk >= cfg.banThreshold)
+            return AegisPunishStage::TempBan;
+        if (risk >= cfg.kickThreshold)
+            return AegisPunishStage::Kick;
+        if (risk >= cfg.jailThreshold)
+            return AegisPunishStage::Jail;
+        if (risk >= cfg.debuffThreshold)
+            return AegisPunishStage::Debuff;
+        return AegisPunishStage::Observe;
+    }
+
+    AegisPunishStage ApplyRiskGate(AegisPunishStage stageByEvidence,
+        AegisPunishStage stageByRisk)
+    {
+        if (stageByRisk == AegisPunishStage::Observe)
+            return AegisPunishStage::Observe;
+
+        if (stageByEvidence == AegisPunishStage::Observe)
+            return stageByRisk;
+
+        return static_cast<AegisPunishStage>(std::min(
+            StageRank(stageByEvidence), StageRank(stageByRisk)));
+    }
+
     AegisPunishStage BasePunishStage(AegisEvidenceEvent const& evidence)
     {
         switch (evidence.cheatType)
@@ -648,6 +692,250 @@ namespace
 
         return text.str();
     }
+
+    void ResetTeleportDetectionWindows(AegisPlayerContext& ctx)
+    {
+        ctx.stationaryMoveWindowStartMs = 0;
+        ctx.stationaryMoveHits = 0;
+        ctx.teleportBurstWindowStartMs = 0;
+        ctx.teleportBurstHits = 0;
+    }
+
+    void ClearPendingTeleportExpectation(AegisPlayerContext& ctx);
+
+    void ResetMovementDetectionState(AegisPlayerContext& ctx)
+    {
+        ctx.samples.Clear();
+        ctx.safePosition = AegisSafePosition{};
+        ctx.lastGeometryCheckMs = 0;
+        ctx.flyWindowStartMs = 0;
+        ctx.flySuspicionHits = 0;
+        ctx.noClipWindowStartMs = 0;
+        ctx.noClipBlockedHits = 0;
+        ctx.speedWindowStartMs = 0;
+        ctx.speedHits = 0;
+        ctx.timeWindowStartMs = 0;
+        ctx.timeHits = 0;
+        ctx.airStallWindowStartMs = 0;
+        ctx.airStallHits = 0;
+        ctx.waterWalkWindowStartMs = 0;
+        ctx.waterWalkHits = 0;
+        ctx.mountWindowStartMs = 0;
+        ctx.mountHits = 0;
+        ctx.forceMoveWindowStartMs = 0;
+        ctx.forceMoveHits = 0;
+        ctx.climbWindowStartMs = 0;
+        ctx.climbHitsInWindow = 0;
+        ctx.superJumpWindowStartMs = 0;
+        ctx.superJumpHitsInWindow = 0;
+        ctx.doubleJumpWindowStartMs = 0;
+        ctx.doubleJumpHits = 0;
+        ctx.transportSpeedWindowStartMs = 0;
+        ctx.transportSpeedHits = 0;
+        ResetTeleportDetectionWindows(ctx);
+        ClearControlledMoveExpectation(ctx);
+    }
+
+    void ResetMovementLifecycleState(AegisPlayerContext& ctx)
+    {
+        bool serverCanFly = ctx.serverCanFly;
+        ResetMovementDetectionState(ctx);
+        ctx.serverCanFly = serverCanFly;
+        ctx.lastNotifyMs = 0;
+        ctx.lastEvidenceMs = 0;
+        ctx.lastEvidenceTag.clear();
+        ctx.lastSpellGraceMs = 0;
+        ctx.lastTeleportMs = 0;
+        ctx.lastAuthorizedAerialMs = 0;
+        ctx.lastMapChangeMs = 0;
+        ctx.lastVehicleMs = 0;
+        ctx.lastTransportMs = 0;
+        ctx.lastTaxiFlightMs = 0;
+        ctx.lastFallMs = 0;
+        ctx.lastCanFlyServerMs = 0;
+        ctx.lastAckMountMs = 0;
+        ctx.lastControlledTeleportMs = 0;
+        ctx.lastControlledChargeMs = 0;
+        ctx.lastControlledJumpMs = 0;
+        ctx.lastControlledPullMs = 0;
+        ctx.lastKnockBackAckMs = 0;
+        ctx.lastRootAckMs = 0;
+        ctx.lastJumpOpcodeMs = 0;
+        ctx.lastJailReturnCheckMs = 0;
+        ctx.lastPunishNotifyMs = 0;
+        ctx.observedAuthorizedAerialState = false;
+        ctx.observedTaxiFlightState = false;
+        ctx.observedTransportState = false;
+        ctx.observedVehicleState = false;
+        ctx.gather = AegisGatherState{};
+        ClearPendingTeleportExpectation(ctx);
+    }
+
+    uint32 MovementSampleContinuityResetMs(AegisConfig const& cfg)
+    {
+        return std::max<uint32>(5000, cfg.speedMaxDtMs * 3);
+    }
+
+    bool SyncMovementBoundaryState(Player* player, MovementInfo const& movementInfo,
+        AegisPlayerContext& ctx, uint32 nowMs)
+    {
+        if (!player)
+            return false;
+
+        bool hasAuthorizedAerialState =
+            IsServerAuthorizedAerialState(player) || player->IsMounted() ||
+            player->HasIncreaseMountedFlightSpeedAura() ||
+            player->HasHoverAura() || ctx.serverCanFly;
+        bool hasTaxiFlight = player->IsInFlight();
+        bool hasTransport = player->GetTransport() != nullptr ||
+            (movementInfo.GetMovementFlags() & MOVEMENTFLAG_ONTRANSPORT) != 0;
+        bool hasVehicle = player->GetVehicle() != nullptr;
+        bool movementBoundaryChanged =
+            hasAuthorizedAerialState != ctx.observedAuthorizedAerialState ||
+            hasTaxiFlight != ctx.observedTaxiFlightState ||
+            hasTransport != ctx.observedTransportState ||
+            hasVehicle != ctx.observedVehicleState;
+
+        if (movementBoundaryChanged)
+        {
+            if (hasAuthorizedAerialState != ctx.observedAuthorizedAerialState)
+                ctx.lastAuthorizedAerialMs = nowMs;
+            if (hasTaxiFlight != ctx.observedTaxiFlightState)
+                ctx.lastTaxiFlightMs = nowMs;
+            if (hasTransport != ctx.observedTransportState)
+                ctx.lastTransportMs = nowMs;
+            if (hasVehicle != ctx.observedVehicleState)
+                ctx.lastVehicleMs = nowMs;
+
+            ResetMovementDetectionState(ctx);
+        }
+
+        if (hasAuthorizedAerialState)
+            ctx.lastAuthorizedAerialMs = nowMs;
+        if (hasTaxiFlight)
+            ctx.lastTaxiFlightMs = nowMs;
+        if (hasTransport)
+            ctx.lastTransportMs = nowMs;
+        if (hasVehicle)
+            ctx.lastVehicleMs = nowMs;
+        if ((movementInfo.GetMovementFlags() &
+            (MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR |
+                MOVEMENTFLAG_SWIMMING)) != 0)
+            ctx.lastFallMs = nowMs;
+
+        ctx.observedAuthorizedAerialState = hasAuthorizedAerialState;
+        ctx.observedTaxiFlightState = hasTaxiFlight;
+        ctx.observedTransportState = hasTransport;
+        ctx.observedVehicleState = hasVehicle;
+        return movementBoundaryChanged;
+    }
+
+    bool HasNearbyVerticalSupport(Player* player, AcAegisGeometry const& geometry,
+        float x, float y, float z, float groundZ, float minHeightAboveGround)
+    {
+        if (!player)
+            return false;
+
+        if ((z - groundZ) < minHeightAboveGround)
+            return false;
+
+        float supportRadius = std::clamp(player->GetObjectSize() * 0.6f, 0.35f,
+            1.1f);
+        struct SupportOffset
+        {
+            float offsetX;
+            float offsetY;
+        };
+
+        SupportOffset offsets[] = {
+            { 0.0f, 0.0f },
+            { supportRadius, 0.0f },
+            { -supportRadius, 0.0f },
+            { 0.0f, supportRadius },
+            { 0.0f, -supportRadius },
+        };
+
+        for (SupportOffset const& offset : offsets)
+        {
+            float hitX = 0.0f;
+            float hitY = 0.0f;
+            float hitZ = 0.0f;
+            if (geometry.RaycastStaticAndDynamic(player,
+                x + offset.offsetX, y + offset.offsetY, z + 0.2f,
+                x + offset.offsetX, y + offset.offsetY, groundZ + 0.2f,
+                hitX, hitY, hitZ))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void ClearPendingTeleportExpectation(AegisPlayerContext& ctx)
+    {
+        ctx.pendingTeleportExpireMs = 0;
+        ctx.pendingTeleportMapId = 0;
+        ctx.pendingTeleportX = 0.0f;
+        ctx.pendingTeleportY = 0.0f;
+        ctx.pendingTeleportZ = 0.0f;
+    }
+
+    void ArmPendingTeleportExpectation(AegisPlayerContext& ctx,
+        uint32 nowMs, uint32 mapId, float x, float y, float z,
+        AegisConfig const& cfg)
+    {
+        ctx.pendingTeleportExpireMs = nowMs +
+            std::max(cfg.teleportGraceMs, cfg.teleportArrivalWindowMs);
+        ctx.pendingTeleportMapId = mapId;
+        ctx.pendingTeleportX = x;
+        ctx.pendingTeleportY = y;
+        ctx.pendingTeleportZ = z;
+    }
+
+    bool ConsumePendingTeleportArrival(AegisPlayerContext& ctx,
+        AegisMoveSample const& sample, uint32 nowMs, AegisConfig const& cfg)
+    {
+        if (!ctx.pendingTeleportExpireMs)
+            return false;
+
+        if (nowMs > ctx.pendingTeleportExpireMs)
+        {
+            ClearPendingTeleportExpectation(ctx);
+            return false;
+        }
+
+        if (sample.mapId != ctx.pendingTeleportMapId)
+            return false;
+
+        float dist = Dist3DToPoint(sample.x, sample.y, sample.z,
+            ctx.pendingTeleportX, ctx.pendingTeleportY, ctx.pendingTeleportZ);
+        if (dist > cfg.teleportArrivalRadius)
+            return false;
+
+        ctx.lastTeleportMs = nowMs;
+        ResetTeleportDetectionWindows(ctx);
+        ClearControlledMoveExpectation(ctx);
+        ClearPendingTeleportExpectation(ctx);
+        return true;
+    }
+
+    bool HasSharpDirectionChange2D(AegisMoveSample const& older,
+        AegisMoveSample const& prev, AegisMoveSample const& cur)
+    {
+        float ax = prev.x - older.x;
+        float ay = prev.y - older.y;
+        float bx = cur.x - prev.x;
+        float by = cur.y - prev.y;
+
+        float lenA = std::sqrt(ax * ax + ay * ay);
+        float lenB = std::sqrt(bx * bx + by * by);
+        if (lenA < 0.75f || lenB < 0.75f)
+            return false;
+
+        float cosTurn = ((ax * bx) + (ay * by)) / (lenA * lenB);
+        return cosTurn <= 0.25f;
+    }
 }
 
 AcAegisMgr* AcAegisMgr::instance()
@@ -699,7 +987,7 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     AegisMovementContext movementCtx;
     movementCtx.nowMs = nowMs;
 
-    if (!player)
+    if (!player || !player->IsInWorld())
     {
         movementCtx.shouldSkipAllDetectors = true;
         movementCtx.shouldSkipAerialDetectors = true;
@@ -715,7 +1003,8 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.isTaxiFlight = player->IsInFlight();
     movementCtx.hasTransport = player->GetTransport() != nullptr;
     movementCtx.hasVehicle = player->GetVehicle() != nullptr;
-    movementCtx.hasAuthorizedAerialState = IsServerAuthorizedAerialState(player);
+    movementCtx.hasAuthorizedAerialState =
+        IsServerAuthorizedAerialState(player) || ctx.serverCanFly;
     movementCtx.hasExternalAerialAura = HasExternalMobilityAura(player);
     movementCtx.hasWaterWalkAura = player->HasWaterWalkAura();
     movementCtx.hasGhostAura = player->HasGhostAura();
@@ -753,6 +1042,10 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.recentServerCanFly = ctx.serverCanFly && IsRecentTimestamp(nowMs, ctx.lastCanFlyServerMs, cfg.flyCanFlyGraceMs);
     movementCtx.recentMountAck = IsRecentTimestamp(nowMs, ctx.lastAckMountMs, cfg.flyCanFlyGraceMs);
     movementCtx.recentMountGrace = IsRecentTimestamp(nowMs, ctx.lastAckMountMs, cfg.mountGraceMs);
+    movementCtx.recentAerialExitGrace =
+        !movementCtx.hasAuthorizedAerialState &&
+        IsRecentTimestamp(nowMs, ctx.lastAuthorizedAerialMs,
+            std::max(cfg.flyCanFlyGraceMs, cfg.mountGraceMs));
     movementCtx.recentJump = IsRecentTimestamp(nowMs, ctx.lastJumpOpcodeMs, cfg.superJumpWindowMs);
     movementCtx.recentExtendedJump = IsRecentTimestamp(nowMs, ctx.lastJumpOpcodeMs, cfg.superJumpWindowMs + 300);
     movementCtx.recentFall = IsRecentTimestamp(nowMs, ctx.lastFallMs, cfg.fallGraceMs);
@@ -778,11 +1071,13 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
         movementCtx.recentTransportGrace ||
         movementCtx.recentRootAckGrace ||
         movementCtx.recentFallGrace ||
+        movementCtx.recentAerialExitGrace ||
         movementCtx.recentKnockBackGrace;
 
     movementCtx.shouldSkipAerialDetectors =
         movementCtx.shouldSkipAllDetectors ||
         HasWhitelistedAura(movementCtx) ||
+        movementCtx.hasGhostAura ||
         movementCtx.recentServerCanFly ||
         movementCtx.recentMountAck;
 
@@ -809,7 +1104,26 @@ float AcAegisMgr::ComputeAllowedSpeed(Player* player, MovementInfo const& moveme
     if (!player)
         return 0.0f;
 
-    return player->GetSpeed(movementInfo.GetSpeedType());
+    uint32 moveFlags = movementInfo.GetMovementFlags();
+    UnitMoveType speedType = movementInfo.GetSpeedType();
+    float allowed = player->GetSpeed(speedType);
+
+    bool hasAuthorizedFlight =
+        (moveFlags & (MOVEMENTFLAG_FLYING | MOVEMENTFLAG_CAN_FLY |
+            MOVEMENTFLAG_DISABLE_GRAVITY)) != 0 ||
+        player->IsInFlight() ||
+        player->HasIncreaseMountedFlightSpeedAura() ||
+        IsServerAuthorizedAerialState(player) ||
+        player->HasHoverAura() ||
+        player->HasAuraType(SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED);
+    if (hasAuthorizedFlight)
+    {
+        UnitMoveType flightSpeedType = (moveFlags & MOVEMENTFLAG_BACKWARD) != 0 ?
+            MOVE_FLIGHT_BACK : MOVE_FLIGHT;
+        allowed = std::max(allowed, player->GetSpeed(flightSpeedType));
+    }
+
+    return allowed;
 }
 
 void AcAegisMgr::CaptureSample(Player* player, MovementInfo const& movementInfo, uint32 opcode, AegisPlayerContext& ctx)
@@ -1075,44 +1389,88 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectTransportRelativeSpeed(Playe
     if (!cfg.speedEnabled || ctx.samples.Size() < 2)
         return std::nullopt;
 
+    auto resetTransportSpeedWindow = [&ctx]()
+    {
+        ctx.transportSpeedWindowStartMs = 0;
+        ctx.transportSpeedHits = 0;
+    };
+
     AegisMoveSample const& cur = ctx.samples.Newest();
     AegisMoveSample const& prev = ctx.samples.Previous();
     if ((cur.moveFlags & MOVEMENTFLAG_ONTRANSPORT) == 0 ||
         (prev.moveFlags & MOVEMENTFLAG_ONTRANSPORT) == 0)
+    {
+        resetTransportSpeedWindow();
         return std::nullopt;
+    }
 
     if (cur.transportGuidCounter == 0 ||
         cur.transportGuidCounter != prev.transportGuidCounter ||
         cur.transportSeat != prev.transportSeat ||
         cur.serverMs <= prev.serverMs)
+    {
+        resetTransportSpeedWindow();
         return std::nullopt;
+    }
 
     uint32 dtMs = cur.serverMs - prev.serverMs;
     if (dtMs < cfg.speedMinDtMs || dtMs > cfg.speedMaxDtMs)
+    {
+        resetTransportSpeedWindow();
         return std::nullopt;
+    }
 
     float dist2d = TransportDist2D(cur, prev);
-    float deltaZ = std::fabs(cur.transportZ - prev.transportZ);
-    if (dist2d < 0.1f && deltaZ < 0.15f)
+    if (dist2d < 0.5f)
+    {
+        resetTransportSpeedWindow();
         return std::nullopt;
+    }
 
     float observed = dist2d * 1000.0f / static_cast<float>(dtMs);
     float allowed = std::max(0.01f, std::max(prev.allowedSpeed, cur.allowedSpeed));
     float threshold = allowed * (1.0f + cfg.speedTolerancePct / 100.0f) +
         cfg.speedFlatMargin + 0.5f;
-    if (observed <= threshold && deltaZ < cfg.climbMinRise)
+    if (observed <= threshold)
+    {
+        resetTransportSpeedWindow();
+        return std::nullopt;
+    }
+
+    float excess = observed - threshold;
+    float minExcess = std::max(0.75f, threshold * 0.08f);
+    if (excess < minExcess)
+    {
+        resetTransportSpeedWindow();
+        return std::nullopt;
+    }
+
+    float ratio = std::min(4.0f, observed / std::max(0.01f, threshold));
+    bool massiveSpike = ratio >= std::max(cfg.speedStrongRatio + 0.6f, 2.25f);
+
+    if (ctx.transportSpeedWindowStartMs == 0 ||
+        (cur.serverMs - ctx.transportSpeedWindowStartMs) > cfg.speedWindowMs)
+    {
+        ctx.transportSpeedWindowStartMs = cur.serverMs;
+        ctx.transportSpeedHits = 0;
+    }
+
+    ++ctx.transportSpeedHits;
+    if (!massiveSpike && ctx.transportSpeedHits < 3)
         return std::nullopt;
 
     AegisEvidenceEvent evidence;
     evidence.cheatType = AegisCheatType::Speed;
-    evidence.level = (observed > (threshold * cfg.speedStrongRatio) ||
-        deltaZ >= cfg.climbMinRise) ?
+    evidence.level = (massiveSpike || ctx.transportSpeedHits >= 4) ?
         AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
     evidence.tag = "TransportRelativeSpeed";
     evidence.detail = "observed=" + std::to_string(observed) +
-        ",allowed=" + std::to_string(threshold);
+        ",allowed=" + std::to_string(threshold) +
+        ",hits=" + std::to_string(ctx.transportSpeedHits);
     evidence.riskDelta = ClampRiskDelta(6.0f +
-        std::min(10.0f, (observed / std::max(0.01f, threshold)) * 4.0f));
+        std::min(10.0f, ratio * 4.0f) +
+        std::min(4.0f,
+            static_cast<float>(ctx.transportSpeedHits - 1) * 1.5f));
     evidence.serverMs = cur.serverMs;
     evidence.shouldRollback = false;
     evidence.metricA = observed;
@@ -1704,10 +2062,19 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectTeleport(Player* player, Aeg
     float deltaZ = std::fabs(cur.z - prev.z);
 
     bool stationaryCoordinateShift = false;
-    if (!HasActiveMovementIntent(cur.moveFlags) && dtMs >= 80 && dtMs <= cfg.speedMaxDtMs)
+    bool noIntentNow = !HasActiveMovementIntent(cur.moveFlags);
+    bool noIntentPrev = !HasActiveMovementIntent(prev.moveFlags);
+    if (noIntentNow && noIntentPrev && dtMs >= 80 && dtMs <= cfg.speedMaxDtMs)
     {
-        bool meaningfulShift = dist2d >= std::max(cfg.teleportStationaryMinDistance2D, cfg.noClipMinSegmentDistance * 0.5f) ||
-            deltaZ >= std::max(cfg.teleportStationaryMinDeltaZ, cfg.climbMinRise);
+        float stationaryMinDistance2D = std::max({
+            cfg.teleportStationaryMinDistance2D,
+            cfg.noClipMinSegmentDistance * 0.5f,
+            cfg.teleportMinDistance * 0.25f
+        });
+        float stationaryMinDeltaZ = std::max(cfg.teleportStationaryMinDeltaZ,
+            cfg.climbMinRise * 2.0f);
+        bool meaningfulShift = dist2d >= stationaryMinDistance2D ||
+            deltaZ >= stationaryMinDeltaZ;
         if (meaningfulShift)
         {
             if (ctx.stationaryMoveWindowStartMs == 0 || (cur.serverMs - ctx.stationaryMoveWindowStartMs) > cfg.teleportStationaryWindowMs)
@@ -1863,6 +2230,16 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
         }
     }
 
+    if (!cumulativePath && ctx.samples.Size() >= 3)
+    {
+        AegisMoveSample const& older = ctx.samples.GetFromNewest(2);
+        if (older.mapId == prev.mapId && HasSharpDirectionChange2D(older, prev, cur))
+        {
+            resetWindow();
+            return std::nullopt;
+        }
+    }
+
     if (dist2d < cfg.noClipMinSegmentDistance || dist2d > cfg.noClipMaxDirectDistance)
     {
         resetWindow();
@@ -1909,15 +2286,20 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
             ctx.noClipWindowStartMs = cur.serverMs;
             ctx.noClipBlockedHits = 0;
         }
+    }
 
-        ++ctx.noClipBlockedHits;
-        if (ctx.noClipBlockedHits < cfg.noClipCumulativeStrongHits)
-            return std::nullopt;
-    }
-    else
+    if (ctx.noClipWindowStartMs == 0 || (cur.serverMs - ctx.noClipWindowStartMs) > cfg.noClipCumulativeWindowMs)
     {
-        resetWindow();
+        ctx.noClipWindowStartMs = cur.serverMs;
+        ctx.noClipBlockedHits = 0;
     }
+
+    ++ctx.noClipBlockedHits;
+    uint32 requiredHits = cumulativePath ?
+        cfg.noClipCumulativeStrongHits :
+        std::max<uint32>(2, cfg.noClipCumulativeStrongHits);
+    if (ctx.noClipBlockedHits < requiredHits)
+        return std::nullopt;
 
     AegisEvidenceEvent evidence;
     evidence.cheatType = AegisCheatType::NoClip;
@@ -1926,7 +2308,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
     evidence.detail = hasLongPath ? geometry.reason + "|" + longPath.reason : geometry.reason;
     evidence.riskDelta = ClampRiskDelta(evidence.level == AegisEvidenceLevel::Strong ? 18.0f : 12.0f);
     evidence.serverMs = cur.serverMs;
-    evidence.shouldRollback = cumulativePath ? ctx.noClipBlockedHits >= cfg.noClipCumulativeStrongHits : true;
+    evidence.shouldRollback = evidence.level == AegisEvidenceLevel::Strong;
     evidence.geometryConfirmed = true;
     evidence.geometryReason = hasLongPath ? longPath.reason : geometry.reason;
     evidence.metricA = geometry.directDistance;
@@ -1975,6 +2357,13 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectFly(Player* player, AegisPla
             cur.x, cur.y, cur.z + 0.2f,
             cur.x, cur.y, groundZ + 0.2f,
             hitX, hitY, hitZ);
+
+        if (!platformBetweenPlayerAndGround)
+        {
+            platformBetweenPlayerAndGround = HasNearbyVerticalSupport(player,
+                _geometry, cur.x, cur.y, cur.z, groundZ,
+                cfg.flyMinHeightAboveGround);
+        }
     }
 
     bool sustainedCandidate =
@@ -2282,7 +2671,18 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectClimb(Player* player, AegisP
         if (_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, groundZ))
         {
             float heightOverGround = std::max(0.0f, cur.z - groundZ);
-            if (heightOverGround >= cfg.superJumpMinHeight && deltaZ >= cfg.superJumpMinDeltaZ)
+            float hitX = 0.0f;
+            float hitY = 0.0f;
+            float hitZ = 0.0f;
+            bool platformBetweenPlayerAndGround =
+                heightOverGround >= cfg.superJumpMinHeight &&
+                _geometry.RaycastStaticAndDynamic(player,
+                    cur.x, cur.y, cur.z + 0.2f,
+                    cur.x, cur.y, groundZ + 0.2f,
+                    hitX, hitY, hitZ);
+            if (!platformBetweenPlayerAndGround &&
+                heightOverGround >= cfg.superJumpMinHeight &&
+                deltaZ >= cfg.superJumpMinDeltaZ)
             {
                 if (ctx.superJumpWindowStartMs == 0 || (cur.serverMs - ctx.superJumpWindowStartMs) > cfg.superJumpWindowMs)
                 {
@@ -2704,9 +3104,11 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
         baseStage = AegisPunishStage::Debuff;
     }
 
-    AegisPunishStage finalStage = cfg.offenseEnabled ?
+    AegisPunishStage stageByEvidence = cfg.offenseEnabled ?
         RaisePunishStage(baseStage, ctx.punish.offenseTier, cfg) :
         baseStage;
+    AegisPunishStage stageByRisk = RiskThresholdStage(ctx.riskScore, cfg);
+    AegisPunishStage finalStage = ApplyRiskGate(stageByEvidence, stageByRisk);
 
     uint32 pendingPunishOffenseCount =
         ctx.punish.offenseCount +
@@ -2726,8 +3128,11 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
 
         if (!allowBan)
             finalStage = AegisPunishStage::Kick;
-        else if (finalStage == AegisPunishStage::PermBan &&
-            (!cfg.stage5Permanent || pendingPunishTier < cfg.banPermanentTier))
+        else if (stageByEvidence == AegisPunishStage::PermBan &&
+            cfg.stage5Permanent &&
+            pendingPunishTier >= cfg.banPermanentTier)
+            finalStage = AegisPunishStage::PermBan;
+        else
             finalStage = AegisPunishStage::TempBan;
     }
 
@@ -2787,7 +3192,8 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
             decision.primaryAction = AegisActionType::BanAccountByCharacter;
         decision.banMode = cfg.banMode;
         decision.banSeconds =
-            (decision.pendingOffenseTier >= 4 ? cfg.stage4BanDays : cfg.stage3BanDays) * DAY;
+            (decision.pendingOffenseTier >= 4 ?
+                cfg.banStage4Days : cfg.banStage3Days) * DAY;
         break;
     case AegisPunishStage::PermBan:
         if (cfg.banMode == "character")
@@ -2826,6 +3232,7 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
     uint32 nowMs = ctx.samples.Empty() ? _elapsedMs : ctx.samples.Newest().serverMs;
     int64 nowEpoch = static_cast<int64>(std::time(nullptr));
     AegisPunishStage stageBefore = ctx.punish.punishStage;
+    AegisPunishState punishBefore = ctx.punish;
     uint32 offenseBefore = ctx.punish.offenseCount;
     uint8 tierBefore = ctx.punish.offenseTier;
     std::string executionResult = "observe";
@@ -2948,7 +3355,8 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
         break;
     }
 
-    SavePunishState(playerGuid, accountId, ctx);
+    if (PersistentPunishStateChanged(punishBefore, ctx.punish))
+        SavePunishState(playerGuid, accountId, ctx);
 
     if (cfg.punishBroadcastEnabled && (actionTaken || rollbackExecuted) &&
         announcedAction != AegisActionType::None)
@@ -3131,36 +3539,9 @@ void AcAegisMgr::ClearPlayerOffense(Player* player)
     bool wasJailed = ctx.punish.jailUntilEpoch > nowEpoch;
     bool hadBanState = ctx.punish.permanentBan || ctx.punish.banUntilEpoch > 0;
 
+    ResetMovementLifecycleState(ctx);
     ctx.riskScore = 0.0f;
     ctx.lastDecayMs = _elapsedMs;
-    ctx.lastNotifyMs = 0;
-    ctx.lastEvidenceMs = 0;
-    ctx.lastEvidenceTag.clear();
-    ctx.lastJailReturnCheckMs = 0;
-    ctx.lastKnockBackAckMs = 0;
-    ctx.flyWindowStartMs = 0;
-    ctx.flySuspicionHits = 0;
-    ctx.noClipWindowStartMs = 0;
-    ctx.noClipBlockedHits = 0;
-    ctx.timeWindowStartMs = 0;
-    ctx.timeHits = 0;
-    ctx.airStallWindowStartMs = 0;
-    ctx.airStallHits = 0;
-    ctx.waterWalkWindowStartMs = 0;
-    ctx.waterWalkHits = 0;
-    ctx.mountWindowStartMs = 0;
-    ctx.mountHits = 0;
-    ctx.forceMoveWindowStartMs = 0;
-    ctx.forceMoveHits = 0;
-    ctx.climbWindowStartMs = 0;
-    ctx.climbHitsInWindow = 0;
-    ctx.superJumpWindowStartMs = 0;
-    ctx.superJumpHitsInWindow = 0;
-    ctx.stationaryMoveWindowStartMs = 0;
-    ctx.stationaryMoveHits = 0;
-    ctx.samples.Clear();
-    ctx.safePosition = AegisSafePosition{};
-    ctx.gather = AegisGatherState{};
     ctx.punish = AegisPunishState{};
 
     ClearDebuffs(player);
@@ -3255,6 +3636,8 @@ void AcAegisMgr::OnLogin(Player* player)
     Touch(player);
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.online = true;
+    ResetMovementLifecycleState(ctx);
+    ctx.punish = AegisPunishState{};
 
     AegisOffenseRecord record;
     if (_persistence.LoadOffense(player, record))
@@ -3356,6 +3739,7 @@ void AcAegisMgr::OnLogout(Player* player)
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.online = false;
     ctx.lastSeenMs = _elapsedMs;
+    ResetMovementLifecycleState(ctx);
 
     WriteAuditLog("logout", player, &ctx, "\"reason\":\"session-end\"");
 }
@@ -3467,7 +3851,10 @@ void AcAegisMgr::CleanupOfflineContexts()
     uint32 ttlMs = 300000;
     for (auto it = _players.begin(); it != _players.end();)
     {
-        AegisPlayerContext const& ctx = it->second;
+        AegisPlayerContext& ctx = it->second;
+        if (!ctx.online)
+            DecayRisk(ctx, _elapsedMs);
+
         bool activePunish = ctx.punish.permanentBan || ctx.punish.debuffUntilEpoch > 0 || ctx.punish.jailUntilEpoch > 0 || ctx.punish.banUntilEpoch > 0;
         bool stale = !ctx.online && _elapsedMs >= ctx.lastSeenMs && (_elapsedMs - ctx.lastSeenMs) > ttlMs;
         if (stale && ctx.riskScore <= 0.0f && !activePunish)
@@ -3590,19 +3977,7 @@ void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
     if (HasControlledPullEffect(spellInfo))
     {
         ctx.lastControlledPullMs = _elapsedMs;
-        float minDistance2D = 0.75f;
-        if (Unit* target = spell->m_targets.GetUnitTarget())
-            minDistance2D = std::clamp(player->GetDistance2d(target), 0.75f, 6.0f) * 0.15f;
-        else if (spell->m_targets.HasDst())
-        {
-            WorldLocation const* dst = spell->m_targets.GetDstPos();
-            minDistance2D = std::clamp(Dist3DToPoint(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(),
-                dst->GetPositionX(), dst->GetPositionY(), player->GetPositionZ()), 0.75f, 6.0f) * 0.15f;
-        }
-
-        ArmControlledMoveExpectation(ctx, AegisControlledMoveKind::Pull,
-            _elapsedMs, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(),
-            std::max(0.75f, minDistance2D), 0.25f);
+        ctx.lastSpellGraceMs = _elapsedMs;
     }
 
     if (std::find(sAcAegisConfig->Get().afkIgnoreSpellIds.begin(), sAcAegisConfig->Get().afkIgnoreSpellIds.end(), spellInfo->Id) != sAcAegisConfig->Get().afkIgnoreSpellIds.end())
@@ -3638,6 +4013,8 @@ bool AcAegisMgr::OnBeforeTeleport(Player* player, uint32 mapId, float x, float y
     }
 
     ctx.lastTeleportMs = _elapsedMs;
+    ArmPendingTeleportExpectation(ctx, _elapsedMs, mapId, x, y, z, cfg);
+    ResetTeleportDetectionWindows(ctx);
     ClearControlledMoveExpectation(ctx);
     return true;
 }
@@ -3648,8 +4025,8 @@ void AcAegisMgr::OnMapChanged(Player* player)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
+    ResetMovementLifecycleState(ctx);
     ctx.lastMapChangeMs = _elapsedMs;
-    ClearControlledMoveExpectation(ctx);
     ResetGatherWindow(player, ctx, "map-changed");
 }
 
@@ -3675,8 +4052,13 @@ void AcAegisMgr::OnCanFlyByServer(Player* player, bool apply)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
+    bool changed = ctx.serverCanFly != apply;
     ctx.serverCanFly = apply;
     ctx.lastCanFlyServerMs = _elapsedMs;
+    ctx.lastAuthorizedAerialMs = _elapsedMs;
+
+    if (changed)
+        ResetMovementDetectionState(ctx);
 }
 
 void AcAegisMgr::OnUnderAckMount(Player* player)
@@ -3685,16 +4067,24 @@ void AcAegisMgr::OnUnderAckMount(Player* player)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
+    ctx.lastAckMountMs = _elapsedMs;
+
     if (player->IsMounted() || player->HasIncreaseMountedSpeedAura() ||
-        player->HasIncreaseMountedFlightSpeedAura())
-    {
-        ctx.lastAckMountMs = _elapsedMs;
-        return;
-    }
+        player->HasIncreaseMountedFlightSpeedAura() ||
+        player->HasWaterWalkAura() || player->HasHoverAura() ||
+        IsServerAuthorizedAerialState(player) || ctx.serverCanFly)
+        ctx.lastAuthorizedAerialMs = _elapsedMs;
 
     if (player->HasWaterWalkAura() || player->HasHoverAura() ||
         IsServerAuthorizedAerialState(player))
         ctx.lastSpellGraceMs = _elapsedMs;
+
+    if (player->GetTransport())
+        ctx.lastTransportMs = _elapsedMs;
+    if (player->GetVehicle())
+        ctx.lastVehicleMs = _elapsedMs;
+
+    ResetMovementDetectionState(ctx);
 }
 
 void AcAegisMgr::OnVehicleTransition(Player* player)
@@ -3704,19 +4094,8 @@ void AcAegisMgr::OnVehicleTransition(Player* player)
 
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.lastVehicleMs = _elapsedMs;
-    ClearControlledMoveExpectation(ctx);
+    ResetMovementDetectionState(ctx);
     ResetGatherWindow(player, ctx, "vehicle-transition");
-}
-
-void AcAegisMgr::OnTransportTransition(Player* player)
-{
-    if (!player)
-        return;
-
-    AegisPlayerContext& ctx = GetOrCreate(player);
-    ctx.lastTransportMs = _elapsedMs;
-    ClearControlledMoveExpectation(ctx);
-    ResetGatherWindow(player, ctx, "transport-transition");
 }
 
 void AcAegisMgr::OnRootAckUpd(Player* player)
@@ -3741,14 +4120,7 @@ void AcAegisMgr::OnMovementInfoUpdate(Player* player, MovementInfo const& moveme
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
-    if (player->IsInFlight())
-        ctx.lastTaxiFlightMs = _elapsedMs;
-    if ((movementInfo.GetMovementFlags() & MOVEMENTFLAG_ONTRANSPORT) != 0)
-        ctx.lastTransportMs = _elapsedMs;
-    if (player->GetVehicle())
-        ctx.lastVehicleMs = _elapsedMs;
-    if ((movementInfo.GetMovementFlags() & (MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR | MOVEMENTFLAG_SWIMMING)) != 0)
-        ctx.lastFallMs = _elapsedMs;
+    SyncMovementBoundaryState(player, movementInfo, ctx, _elapsedMs);
 }
 
 void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 opcode)
@@ -3758,7 +4130,22 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
 
     Touch(player);
     AegisPlayerContext& ctx = GetOrCreate(player);
+    AegisConfig const& cfg = sAcAegisConfig->Get();
+    if (!ctx.samples.Empty())
+    {
+        AegisMoveSample const& newest = ctx.samples.Newest();
+        if (_elapsedMs > newest.serverMs &&
+            (_elapsedMs - newest.serverMs) > MovementSampleContinuityResetMs(cfg))
+        {
+            ResetMovementDetectionState(ctx);
+        }
+    }
+
+    SyncMovementBoundaryState(player, movementInfo, ctx, _elapsedMs);
+
     CaptureSample(player, movementInfo, opcode, ctx);
+    ConsumePendingTeleportArrival(ctx, ctx.samples.Newest(), _elapsedMs,
+        cfg);
 
     if (ctx.gather.windowStartMs != 0)
     {
@@ -3770,7 +4157,6 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
     if (ctx.samples.Size() < 2)
         return;
 
-    AegisConfig const& cfg = sAcAegisConfig->Get();
     DecayRisk(ctx, _elapsedMs);
 
     AegisMovementContext movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
@@ -3875,15 +4261,22 @@ bool AcAegisMgr::HandleDoubleJump(Player* player, Unit* mover)
     AegisConfig const& cfg = sAcAegisConfig->Get();
     uint32 nowMs = _elapsedMs;
     AegisMovementContext movementCtx = BuildMovementContext(player, ctx, nowMs);
+    auto resetDoubleJumpWindow = [&ctx]()
+    {
+        ctx.doubleJumpWindowStartMs = 0;
+        ctx.doubleJumpHits = 0;
+    };
 
     if (ShouldSkipAerialMovementDetectors(movementCtx))
     {
+        resetDoubleJumpWindow();
         ctx.lastJumpOpcodeMs = nowMs;
         return true;
     }
 
     if (movementCtx.hasAuthorizedAerialState || player->IsInWater() || player->IsUnderWater())
     {
+        resetDoubleJumpWindow();
         ctx.lastJumpOpcodeMs = nowMs;
         return true;
     }
@@ -3891,30 +4284,77 @@ bool AcAegisMgr::HandleDoubleJump(Player* player, Unit* mover)
     float groundZ = 0.0f;
     if (!_geometry.GetGroundHeight(player, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), groundZ))
     {
+        resetDoubleJumpWindow();
         ctx.lastJumpOpcodeMs = nowMs;
         return true;
     }
 
     float heightOverGround = std::max(0.0f, player->GetPositionZ() - groundZ);
+    float hitX = 0.0f;
+    float hitY = 0.0f;
+    float hitZ = 0.0f;
+    bool platformBetweenPlayerAndGround =
+        heightOverGround >= cfg.doubleJumpMinHeight &&
+        _geometry.RaycastStaticAndDynamic(player,
+            player->GetPositionX(), player->GetPositionY(),
+            player->GetPositionZ() + 0.2f,
+            player->GetPositionX(), player->GetPositionY(),
+            groundZ + 0.2f,
+            hitX, hitY, hitZ);
     uint32 prevJumpMs = ctx.lastJumpOpcodeMs;
-    uint32 rapidRepeatWindow = std::min(cfg.doubleJumpMaxRepeatMs, cfg.superJumpWindowMs);
+    uint32 rapidRepeatWindow = std::min(cfg.doubleJumpMaxRepeatMs,
+        cfg.doubleJumpWindowMs);
     bool rapidRepeat = prevJumpMs && nowMs > prevJumpMs && (nowMs - prevJumpMs) <= rapidRepeatWindow;
-    bool airborne = player->IsFalling() || heightOverGround >= std::max(cfg.doubleJumpMinHeight, cfg.climbMinRise);
+    float moved2d = 0.0f;
+    float riseZ = 0.0f;
+    if (ctx.samples.Size() >= 2)
+    {
+        AegisMoveSample const& cur = ctx.samples.Newest();
+        AegisMoveSample const& prev = ctx.samples.Previous();
+        if (cur.mapId == prev.mapId)
+        {
+            moved2d = Dist2D(cur, prev);
+            riseZ = cur.z - prev.z;
+        }
+    }
+    bool airborne = player->IsFalling() &&
+        heightOverGround >= std::max(cfg.doubleJumpMinHeight,
+            cfg.climbMinRise * 1.5f);
 
     ctx.lastJumpOpcodeMs = nowMs;
-    if (!rapidRepeat || !airborne)
+    if (!rapidRepeat || !airborne || platformBetweenPlayerAndGround ||
+        moved2d > 1.5f || riseZ <= 0.1f)
+    {
+        if (!rapidRepeat || platformBetweenPlayerAndGround || moved2d > 1.5f)
+            resetDoubleJumpWindow();
+        return true;
+    }
+
+    if (ctx.doubleJumpWindowStartMs == 0 ||
+        (nowMs - ctx.doubleJumpWindowStartMs) > cfg.doubleJumpWindowMs)
+    {
+        ctx.doubleJumpWindowStartMs = nowMs;
+        ctx.doubleJumpHits = 0;
+    }
+
+    ++ctx.doubleJumpHits;
+    if (ctx.doubleJumpHits < std::max<uint32>(3, cfg.doubleJumpRepeatHits))
         return true;
 
     AegisEvidenceEvent evidence;
     evidence.cheatType = AegisCheatType::Climb;
-    evidence.level = heightOverGround >= cfg.superJumpMinHeight ? AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
+    evidence.level = (ctx.doubleJumpHits > cfg.doubleJumpRepeatHits ||
+        heightOverGround >= cfg.superJumpMinHeight) ?
+        AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
     evidence.tag = "DoubleJump";
-    evidence.detail = "height=" + std::to_string(heightOverGround);
+    evidence.detail = "height=" + std::to_string(heightOverGround) +
+        ",hits=" + std::to_string(ctx.doubleJumpHits);
     evidence.riskDelta = ClampRiskDelta(16.0f + std::min(10.0f, heightOverGround));
     evidence.serverMs = nowMs;
     evidence.shouldRollback = evidence.level == AegisEvidenceLevel::Strong;
     evidence.metricA = heightOverGround;
     evidence.metricB = static_cast<float>(nowMs - prevJumpMs);
     HandleEvidence(player, ctx, evidence);
+    resetDoubleJumpWindow();
     return true;
 }
