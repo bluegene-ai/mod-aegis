@@ -357,6 +357,20 @@ namespace
         return std::find(ids.begin(), ids.end(), id) != ids.end();
     }
 
+    bool HasConfiguredAuraWhitelist(Player* player)
+    {
+        if (!player)
+            return false;
+
+        for (uint32 auraId : sAcAegisConfig->Get().auraWhitelist)
+        {
+            if (player->HasAura(auraId))
+                return true;
+        }
+
+        return false;
+    }
+
     bool IsRecentTimestamp(uint32 nowMs, uint32 markMs, uint32 graceMs)
     {
         return markMs && nowMs >= markMs && (nowMs - markMs) <= graceMs;
@@ -782,23 +796,25 @@ namespace
         if (!player)
             return false;
 
-        bool hasAuthorizedAerialState =
+        bool hasAerialSkipState =
             IsServerAuthorizedAerialState(player) || player->IsMounted() ||
             player->HasIncreaseMountedFlightSpeedAura() ||
-            player->HasHoverAura() || ctx.serverCanFly;
+            player->HasHoverAura() || player->HasWaterWalkAura() ||
+            player->HasGhostAura() ||
+            HasConfiguredAuraWhitelist(player) || ctx.serverCanFly;
         bool hasTaxiFlight = player->IsInFlight();
         bool hasTransport = player->GetTransport() != nullptr ||
             (movementInfo.GetMovementFlags() & MOVEMENTFLAG_ONTRANSPORT) != 0;
         bool hasVehicle = player->GetVehicle() != nullptr;
         bool movementBoundaryChanged =
-            hasAuthorizedAerialState != ctx.observedAuthorizedAerialState ||
+            hasAerialSkipState != ctx.observedAuthorizedAerialState ||
             hasTaxiFlight != ctx.observedTaxiFlightState ||
             hasTransport != ctx.observedTransportState ||
             hasVehicle != ctx.observedVehicleState;
 
         if (movementBoundaryChanged)
         {
-            if (hasAuthorizedAerialState != ctx.observedAuthorizedAerialState)
+            if (hasAerialSkipState != ctx.observedAuthorizedAerialState)
                 ctx.lastAuthorizedAerialMs = nowMs;
             if (hasTaxiFlight != ctx.observedTaxiFlightState)
                 ctx.lastTaxiFlightMs = nowMs;
@@ -810,7 +826,7 @@ namespace
             ResetMovementDetectionState(ctx);
         }
 
-        if (hasAuthorizedAerialState)
+        if (hasAerialSkipState)
             ctx.lastAuthorizedAerialMs = nowMs;
         if (hasTaxiFlight)
             ctx.lastTaxiFlightMs = nowMs;
@@ -823,7 +839,7 @@ namespace
                 MOVEMENTFLAG_SWIMMING)) != 0)
             ctx.lastFallMs = nowMs;
 
-        ctx.observedAuthorizedAerialState = hasAuthorizedAerialState;
+        ctx.observedAuthorizedAerialState = hasAerialSkipState;
         ctx.observedTaxiFlightState = hasTaxiFlight;
         ctx.observedTransportState = hasTransport;
         ctx.observedVehicleState = hasVehicle;
@@ -870,6 +886,22 @@ namespace
         }
 
         return false;
+    }
+
+    LiquidStatus GetLiquidStatusAt(Player* player, float x, float y, float z)
+    {
+        Map* map = player ? player->GetMap() : nullptr;
+        if (!player || !player->IsInWorld() || !map)
+            return LIQUID_MAP_NO_WATER;
+
+        PositionFullTerrainStatus terrainStatus;
+        map->GetFullTerrainStatusForPosition(player->GetPhaseMask(),
+            x,
+            y,
+            z,
+            player->GetCollisionHeight(),
+            terrainStatus);
+        return terrainStatus.liquidInfo.Status;
     }
 
     void ClearPendingTeleportExpectation(AegisPlayerContext& ctx)
@@ -1010,14 +1042,7 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.hasGhostAura = player->HasGhostAura();
     movementCtx.hasHoverAura = player->HasHoverAura();
 
-    for (uint32 auraId : cfg.auraWhitelist)
-    {
-        if (player->HasAura(auraId))
-        {
-            movementCtx.hasConfiguredAuraWhitelist = true;
-            break;
-        }
-    }
+    movementCtx.hasConfiguredAuraWhitelist = HasConfiguredAuraWhitelist(player);
 
     for (uint32 auraId : cfg.afkIgnoreAuras)
     {
@@ -1077,6 +1102,8 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.shouldSkipAerialDetectors =
         movementCtx.shouldSkipAllDetectors ||
         HasWhitelistedAura(movementCtx) ||
+        movementCtx.hasWaterWalkAura ||
+        movementCtx.hasHoverAura ||
         movementCtx.hasGhostAura ||
         movementCtx.recentServerCanFly ||
         movementCtx.recentMountAck;
@@ -2466,11 +2493,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectWaterWalk(Player* player, Ae
     if (!cfg.flyEnabled || !player || ctx.samples.Size() < 2)
         return std::nullopt;
 
-    if (movementCtx.isTaxiFlight || movementCtx.hasTransport || movementCtx.hasVehicle || !movementCtx.hasMap)
-        return std::nullopt;
-
-    if (movementCtx.hasWaterWalkAura || movementCtx.hasGhostAura || movementCtx.hasHoverAura ||
-        movementCtx.hasAuthorizedAerialState)
+    if (!movementCtx.hasMap || ShouldSkipAerialMovementDetectors(movementCtx))
         return std::nullopt;
 
     AegisMoveSample const& cur = ctx.samples.Newest();
@@ -2517,6 +2540,35 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectWaterWalk(Player* player, Ae
     float prevWaterDepth = prevWaterLevel - prevGroundZ;
     float curSurfaceOffset = std::fabs(cur.z - curWaterLevel);
     float prevSurfaceOffset = std::fabs(prev.z - prevWaterLevel);
+    LiquidStatus curLiquidStatus = GetLiquidStatusAt(player, cur.x, cur.y, cur.z);
+    LiquidStatus prevLiquidStatus = GetLiquidStatusAt(player, prev.x, prev.y, prev.z);
+    bool curImmersedInWater = (curLiquidStatus & MAP_LIQUID_STATUS_SWIMMING) != 0;
+    bool prevImmersedInWater = (prevLiquidStatus & MAP_LIQUID_STATUS_SWIMMING) != 0;
+    bool curSupportedSurface = false;
+    bool prevSupportedSurface = false;
+    if (curWaterDepth >= cfg.flyWaterWalkMinWaterDepth)
+    {
+        curSupportedSurface = HasNearbyVerticalSupport(player,
+            _geometry,
+            cur.x,
+            cur.y,
+            cur.z,
+            curGroundZ,
+            cfg.flyWaterWalkMinWaterDepth);
+    }
+
+    if (prevWaterDepth >= cfg.flyWaterWalkMinWaterDepth)
+    {
+        prevSupportedSurface = HasNearbyVerticalSupport(player,
+            _geometry,
+            prev.x,
+            prev.y,
+            prev.z,
+            prevGroundZ,
+            cfg.flyWaterWalkMinWaterDepth);
+    }
+
+    bool sustainedSurfaceSupport = curSupportedSurface && prevSupportedSurface;
     bool swimming = (cur.moveFlags & MOVEMENTFLAG_SWIMMING) != 0;
     bool recentJump = ctx.lastJumpOpcodeMs && (cur.serverMs - ctx.lastJumpOpcodeMs) <= cfg.superJumpWindowMs;
 
@@ -2524,6 +2576,9 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectWaterWalk(Player* player, Ae
         !swimming &&
         !player->IsUnderWater() &&
         !recentJump &&
+        !curImmersedInWater &&
+        !prevImmersedInWater &&
+        !sustainedSurfaceSupport &&
         curWaterDepth >= cfg.flyWaterWalkMinWaterDepth &&
         prevWaterDepth >= cfg.flyWaterWalkMinWaterDepth &&
         curSurfaceOffset <= cfg.flyWaterWalkSurfaceTolerance &&
