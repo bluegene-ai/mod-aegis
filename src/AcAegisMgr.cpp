@@ -1113,7 +1113,9 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
 
 bool AcAegisMgr::HasWhitelistedAura(AegisMovementContext const& movementCtx) const
 {
-    return movementCtx.hasAuthorizedAerialState || movementCtx.hasConfiguredAuraWhitelist;
+   return movementCtx.hasAuthorizedAerialState ||
+        movementCtx.hasExternalAerialAura ||
+        movementCtx.hasConfiguredAuraWhitelist;
 }
 
 bool AcAegisMgr::ShouldSkipAllMovementDetectors(AegisMovementContext const& movementCtx) const
