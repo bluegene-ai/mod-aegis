@@ -38,11 +38,50 @@ bool AcAegisGeometry::GetGroundHeight(Player* player, float x, float y, float z,
     if (terrainStatus.floorZ > INVALID_HEIGHT)
     {
         groundZ = terrainStatus.floorZ;
+        SanitizeGroundHeight(player, x, y, z, groundZ);
         return true;
     }
 
     groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z);
-    return groundZ > INVALID_HEIGHT;
+    if (groundZ > INVALID_HEIGHT)
+    {
+        SanitizeGroundHeight(player, x, y, z, groundZ);
+        return true;
+    }
+
+    return false;
+}
+
+void AcAegisGeometry::SanitizeGroundHeight(Player* player, float x, float y, float z, float& groundZ) const
+{
+    float heightAboveGround = z - groundZ;
+
+    // If the reported ground is implausibly far below the player
+    // (common in multi-story WMO dungeons where vmap hits a lower
+    // floor or terrain base instead of the player's actual surface),
+    // try a short-range raycast to find the nearest surface.
+    constexpr float kImplausibleHeight = 20.0f;
+    constexpr float kShortRaycastDist = 8.0f;
+
+    if (heightAboveGround <= kImplausibleHeight)
+        return;
+
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+    if (RaycastStaticAndDynamic(player,
+            x, y, z + 0.5f,
+            x, y, z - kShortRaycastDist,
+            hitX, hitY, hitZ))
+    {
+        // A surface exists close below the player — the original
+        // groundZ belongs to a different floor or terrain base.
+        // Use the detected surface as the real ground reference.
+        groundZ = hitZ;
+        return;
+    }
+
+    // No surface found within short range — the player may genuinely
+    // be high above any floor.  Keep the original groundZ so that
+    // actual fly hacking can still be detected.
 }
 
 bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,

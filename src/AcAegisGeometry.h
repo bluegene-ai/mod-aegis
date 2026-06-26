@@ -39,6 +39,9 @@ public:
     AegisGeometryResult CheckLongPath(Player* player,
         AegisMoveSample const& from,
         AegisMoveSample const& to) const;
+
+private:
+    void SanitizeGroundHeight(Player* player, float x, float y, float z, float& groundZ) const;
 };
 
 #endif
