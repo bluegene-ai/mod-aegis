@@ -458,6 +458,41 @@ namespace
         return false;
     }
 
+    bool HasAuthorizedSpecialMovement(AegisMovementContext const& movementCtx)
+    {
+        return movementCtx.hasGhostAura ||
+            movementCtx.hasAuthorizedAerialState ||
+            movementCtx.hasExternalAerialAura ||
+            movementCtx.hasConfiguredAuraWhitelist ||
+            movementCtx.recentServerCanFly ||
+            movementCtx.recentAerialExitGrace;
+    }
+
+    bool HasUnstableGroundReference(Player* player,
+        AcAegisGeometry const& geometry,
+        AegisMoveSample const& cur,
+        AegisMoveSample const* prev,
+        float curGroundZ,
+        float maxHorizontalDrift,
+        float maxVerticalDrift,
+        float minHeightJump)
+    {
+        if (!player || !prev || cur.mapId != prev->mapId)
+            return false;
+
+        if (Dist2D(cur, *prev) > maxHorizontalDrift ||
+            std::fabs(cur.z - prev->z) > maxVerticalDrift)
+            return false;
+
+        float prevGroundZ = 0.0f;
+        if (!geometry.GetGroundHeight(player, prev->x, prev->y, prev->z, prevGroundZ))
+            return false;
+
+        float curHeight = std::max(0.0f, cur.z - curGroundZ);
+        float prevHeight = std::max(0.0f, prev->z - prevGroundZ);
+        return std::fabs(curHeight - prevHeight) >= minHeightJump;
+    }
+
     uint8 StageRank(AegisPunishStage stage)
     {
         return static_cast<uint8>(stage);
@@ -720,7 +755,6 @@ namespace
     void ResetMovementDetectionState(AegisPlayerContext& ctx)
     {
         ctx.samples.Clear();
-        ctx.safePosition = AegisSafePosition{};
         ctx.lastGeometryCheckMs = 0;
         ctx.flyWindowStartMs = 0;
         ctx.flySuspicionHits = 0;
@@ -754,6 +788,7 @@ namespace
     {
         bool serverCanFly = ctx.serverCanFly;
         ResetMovementDetectionState(ctx);
+        ctx.safePosition = AegisSafePosition{};
         ctx.serverCanFly = serverCanFly;
         ctx.lastNotifyMs = 0;
         ctx.lastEvidenceMs = 0;
@@ -2351,7 +2386,8 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectFly(Player* player, AegisPla
     if (!cfg.flyEnabled || !player || ctx.samples.Size() < 2)
         return std::nullopt;
 
-    if (ShouldSkipAerialMovementDetectors(movementCtx))
+    if (ShouldSkipAerialMovementDetectors(movementCtx) ||
+        HasAuthorizedSpecialMovement(movementCtx))
         return std::nullopt;
 
     AegisMoveSample const& cur = ctx.samples.Newest();
@@ -2361,6 +2397,16 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectFly(Player* player, AegisPla
 
     float groundZ = 0.0f;
     if (!_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, groundZ))
+        return std::nullopt;
+
+    if (HasUnstableGroundReference(player,
+            _geometry,
+            cur,
+            &prev,
+            groundZ,
+            std::max(2.0f, cfg.flySustainMinHorizontalDistance),
+            std::max(1.5f, cfg.climbMinRise),
+            std::max(20.0f, cfg.flyMinHeightAboveGround * 2.5f)))
         return std::nullopt;
 
     float height = std::max(0.0f, cur.z - groundZ);
@@ -2643,6 +2689,13 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectMount(Player* player, AegisP
     if (movementCtx.recentMountGrace)
         return std::nullopt;
 
+    if (HasAuthorizedSpecialMovement(movementCtx))
+    {
+        ctx.mountWindowStartMs = 0;
+        ctx.mountHits = 0;
+        return std::nullopt;
+    }
+
     Map* map = player->GetMap();
     if (!map)
         return std::nullopt;
@@ -2727,6 +2780,16 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectClimb(Player* player, AegisP
         float groundZ = 0.0f;
         if (_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, groundZ))
         {
+            if (HasUnstableGroundReference(player,
+                    _geometry,
+                    cur,
+                    &prev,
+                    groundZ,
+                    std::max(2.0f, cfg.flySustainMinHorizontalDistance),
+                    std::max(1.5f, cfg.climbMinRise),
+                    std::max(20.0f, cfg.flyMinHeightAboveGround * 2.5f)))
+                return std::nullopt;
+
             float heightOverGround = std::max(0.0f, cur.z - groundZ);
             float hitX = 0.0f;
             float hitY = 0.0f;
@@ -4340,6 +4403,32 @@ bool AcAegisMgr::HandleDoubleJump(Player* player, Unit* mover)
 
     float groundZ = 0.0f;
     if (!_geometry.GetGroundHeight(player, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), groundZ))
+    {
+        resetDoubleJumpWindow();
+        ctx.lastJumpOpcodeMs = nowMs;
+        return true;
+    }
+
+    AegisMoveSample const* prevSample = ctx.samples.Size() >= 2 ? &ctx.samples.Previous() : nullptr;
+    AegisMoveSample curSample;
+    if (!ctx.samples.Empty())
+        curSample = ctx.samples.Newest();
+    else
+    {
+        curSample.mapId = player->GetMapId();
+        curSample.x = player->GetPositionX();
+        curSample.y = player->GetPositionY();
+        curSample.z = player->GetPositionZ();
+    }
+
+    if (HasUnstableGroundReference(player,
+            _geometry,
+            curSample,
+            prevSample,
+            groundZ,
+            std::max(2.0f, cfg.flySustainMinHorizontalDistance),
+            std::max(1.5f, cfg.climbMinRise),
+            std::max(20.0f, cfg.flyMinHeightAboveGround * 2.5f)))
     {
         resetDoubleJumpWindow();
         ctx.lastJumpOpcodeMs = nowMs;
