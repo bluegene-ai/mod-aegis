@@ -4033,6 +4033,9 @@ void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
     if (!player || !spell)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     AegisPlayerContext& ctx = GetOrCreate(player);
     SpellInfo const* spellInfo = spell->GetSpellInfo();
     if (!spellInfo)
@@ -4144,6 +4147,9 @@ void AcAegisMgr::OnMapChanged(Player* player)
     if (!player)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     AegisPlayerContext& ctx = GetOrCreate(player);
     ResetMovementLifecycleState(ctx);
     ctx.lastMapChangeMs = _elapsedMs;
@@ -4155,6 +4161,9 @@ void AcAegisMgr::OnLoot(Player* player)
     if (!player)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     TouchGatherWindow(player, GetOrCreate(player), "loot");
 }
 
@@ -4163,12 +4172,18 @@ void AcAegisMgr::OnGatherAction(Player* player)
     if (!player)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     TouchGatherWindow(player, GetOrCreate(player), "gather");
 }
 
 void AcAegisMgr::OnCanFlyByServer(Player* player, bool apply)
 {
     if (!player)
+        return;
+
+    if (!sAcAegisConfig->Get().enabled)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
@@ -4184,6 +4199,9 @@ void AcAegisMgr::OnCanFlyByServer(Player* player, bool apply)
 void AcAegisMgr::OnUnderAckMount(Player* player)
 {
     if (!player)
+        return;
+
+    if (!sAcAegisConfig->Get().enabled)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
@@ -4212,6 +4230,9 @@ void AcAegisMgr::OnVehicleTransition(Player* player)
     if (!player)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.lastVehicleMs = _elapsedMs;
     ResetMovementDetectionState(ctx);
@@ -4223,6 +4244,9 @@ void AcAegisMgr::OnRootAckUpd(Player* player)
     if (!player)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     GetOrCreate(player).lastRootAckMs = _elapsedMs;
 }
 
@@ -4231,12 +4255,18 @@ void AcAegisMgr::OnJumpOpcode(Player* player, bool jump)
     if (!player || !jump)
         return;
 
+    if (!sAcAegisConfig->Get().enabled)
+        return;
+
     GetOrCreate(player).lastJumpOpcodeMs = _elapsedMs;
 }
 
 void AcAegisMgr::OnMovementInfoUpdate(Player* player, MovementInfo const& movementInfo)
 {
     if (!player)
+        return;
+
+    if (!sAcAegisConfig->Get().enabled)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
