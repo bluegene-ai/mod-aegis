@@ -167,6 +167,13 @@ struct AegisGatherState
     float startX = 0.0f;
     float startY = 0.0f;
     float startZ = 0.0f;
+    // Largest distance from the window origin observed at any counted action. The
+    // current position alone is not enough to tell a planted character from one that
+    // moved away and came back between actions.
+    float maxMoveInWindow = 0.0f;
+    // Set when a counted action happened while the player was in combat. A camp that
+    // also fights is not a pure gathering loop, so it is not reported.
+    bool recentCombatSeen = false;
     std::string lastSource;
 };
 

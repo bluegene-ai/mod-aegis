@@ -545,6 +545,22 @@ AcAegis.Detector.Afk.EvidenceCooldownMs = 300000
 # 忽略型动作后的宽限时间，单位毫秒。
 AcAegis.Detector.Afk.IgnoreActionGraceMs = 120000
 
+# 蹲点判定阈值，单位码。
+#
+# 本服不允许蹲点采集，因此"整个窗口内始终没有离开过一个点"本身就是违规，这一项就是
+# 用来确认这一点的：只有当窗口内每个被计入的动作都发生在这个半径以内时才产出证据。
+#
+# 用的是"窗口内到达过的最大位移"（maxMoveInWindow），不是动作发生时的当前位置，
+# 所以"采一次→走开→再回来采"不会被误判成原地不动。
+#
+# 反过来说，正常跑图采集的玩家在窗口内一定会走出 MaxMoveDistance，窗口会被直接重置，
+# 因此不会命中。
+#
+# 另有两条与蹲点共同生效的边界：
+#   - 窗口内只要在某个动作发生时处于战斗中，该窗口标记为"不是纯采集循环"，不产出证据；
+#   - 窗口内动作发生时若已在载具/传送带/飞行路线上，同样不产出证据。
+AcAegis.Detector.Afk.CampStationaryEpsilon = 0.25
+
 # AFK 忽略技能白名单。
 AcAegis.Detector.Afk.IgnoreSpellIds =
 

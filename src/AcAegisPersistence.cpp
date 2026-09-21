@@ -15,6 +15,12 @@
 
 namespace
 {
+    // Upper bound on how long a GM command (.aegis delete / .aegis purge) may block the
+    // world thread waiting for the queued event rows to be handed to the asynchronous
+    // character database queue. Five seconds is the accepted worst case; on expiry the
+    // command continues and logs a warning instead of stalling indefinitely.
+    constexpr std::chrono::milliseconds kMaxDrainWaitMs{ 5000 };
+
     // SQL literal escaping done locally on purpose: CharacterDatabase.EscapeString()
     // reaches into the synchronous connection pool without locking
     // (DatabaseWorkerPool::EscapeString has no LockIfReady), and the caller may run
@@ -106,24 +112,34 @@ namespace
             _condition.notify_one();
         }
 
-        void Barrier()
+        // Waits until every row enqueued before the call has been handed to the
+        // asynchronous database queue. Bounded: the caller runs on the world thread
+        // (GM command), so an unbounded wait would stall the whole world if the
+        // database or the writer thread is wedged. Returns false when the deadline
+        // expired before the queue drained.
+        bool Barrier(std::chrono::milliseconds timeout)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             if (_stopping)
-                return;
+                return true;
 
             uint64 targetSequence = _nextSequence;
             if (targetSequence == 0 || _completedSequence >= targetSequence)
-                return;
+                return true;
 
             if (targetSequence > _flushTargetSequence)
                 _flushTargetSequence = targetSequence;
 
             _condition.notify_one();
-            _condition.wait(lock, [this, targetSequence]()
+            bool drained = _condition.wait_for(lock, timeout, [this, targetSequence]()
             {
                 return _completedSequence >= targetSequence || _stopping;
             });
+
+            if (!drained)
+                _flushTargetSequence = 0;
+
+            return drained || _stopping;
         }
 
         void DropQueuedForGuid(uint32 guidLow)
@@ -464,7 +480,19 @@ void AcAegisPersistence::DeletePlayerData(uint32 guidLow) const
     // delete. Ordering between the INSERTs and the DELETE relies on the asynchronous
     // pool being FIFO, which is the case with the default
     // CharacterDatabase.WorkerThreads = 1.
-    GetAsyncEventWriter().Barrier();
+    //
+    // The wait is bounded (kMaxDrainWaitMs) because this runs on the world thread from
+    // a GM command. On expiry the delete proceeds anyway and the operator is told, so
+    // the outcome is never silently different from what the command reports.
+    if (!GetAsyncEventWriter().Barrier(kMaxDrainWaitMs))
+    {
+        LOG_WARN("module",
+            "[AcAegis] .aegis delete for guid {} waited {}ms for the queued event rows "
+            "to drain and gave up; the delete is running anyway, so rows still in "
+            "flight may not be removed",
+            guidLow, kMaxDrainWaitMs.count());
+    }
+
     GetAsyncEventWriter().DropQueuedForGuid(guidLow);
     CharacterDatabase.Execute(
         "DELETE FROM ac_aegis_event WHERE guid = {}",
@@ -474,7 +502,15 @@ void AcAegisPersistence::DeletePlayerData(uint32 guidLow) const
 
 void AcAegisPersistence::PurgeAllData() const
 {
-    GetAsyncEventWriter().Barrier();
+    if (!GetAsyncEventWriter().Barrier(kMaxDrainWaitMs))
+    {
+        LOG_WARN("module",
+            "[AcAegis] .aegis purge waited {}ms for the queued event rows to drain and "
+            "gave up; the purge is running anyway, so rows still in flight may not be "
+            "removed",
+            kMaxDrainWaitMs.count());
+    }
+
     GetAsyncEventWriter().DropAllQueued();
     // DELETE instead of TRUNCATE: TRUNCATE requires the DROP privilege, which many
     // production character accounts deliberately do not have.

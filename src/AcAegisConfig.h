@@ -160,6 +160,18 @@ struct AegisConfig
     uint32 afkMinSuspiciousWindows = 2;
     uint32 afkEvidenceCooldownMs = 300000;
     uint32 afkIgnoreActionGraceMs = 120000;
+    // This realm does not allow camping a spawn point, so a character that never
+    // leaves one spot across the whole window is itself the violation. Two window-wide
+    // facts keep that from firing on a player who gathers while moving:
+    //  - the character must have stayed inside CampStationaryEpsilon of the window
+    //    origin at every counted action. The running maximum is used, not the final
+    //    position, so "gather, step away, come back" cannot hide behind a small final
+    //    distance;
+    //  - being in combat at a counted action marks the window as not a pure gathering
+    //    loop, so a camp that also fights is not reported.
+    // A player who gathers across a zone travels well past MaxMoveDistance, which
+    // resets the window entirely.
+    float afkCampStationaryEpsilon = 0.25f;
     std::vector<uint32> afkIgnoreSpellIds;
     std::vector<uint32> afkIgnoreAuras;
 

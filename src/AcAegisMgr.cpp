@@ -1962,6 +1962,8 @@ std::string AcAegisMgr::BuildAuditCommonFields(Player* player, AegisPlayerContex
             payload << ",\"gatherActions\":" << ctx->gather.actionCount
                     << ",\"gatherLoot\":" << ctx->gather.lootCount
                     << ",\"gatherNodes\":" << ctx->gather.gatherCount
+                    << ",\"gatherMaxMoved\":" << ctx->gather.maxMoveInWindow
+                    << ",\"gatherCombatSeen\":" << (ctx->gather.recentCombatSeen ? "true" : "false")
                     << ",\"gatherSuspiciousWindows\":"
                     << ctx->gather.suspiciousWindows
                     << ",\"lastSeenMs\":" << ctx->lastSeenMs
@@ -2198,6 +2200,8 @@ void AcAegisMgr::ResetGatherWindow(Player* player, AegisPlayerContext& ctx, char
     ctx.gather.startX = player->GetPositionX();
     ctx.gather.startY = player->GetPositionY();
     ctx.gather.startZ = player->GetPositionZ();
+    ctx.gather.maxMoveInWindow = 0.0f;
+    ctx.gather.recentCombatSeen = false;
     ctx.gather.lastSource.clear();
 }
 
@@ -2213,10 +2217,16 @@ void AcAegisMgr::TouchGatherWindow(Player* player, AegisPlayerContext& ctx, char
 
     // Looting or gathering while in combat means the player is actively fighting, not
     // running a fixed-position farm loop. Restart the window instead of counting it,
-    // otherwise stationary AoE farming can drift towards the AFK threshold.
+    // otherwise stationary AoE farming can drift towards the AFK threshold. The flag is
+    // also sticky for the current window: combat between two counted actions marks the
+    // window as "not a pure gathering loop", so a camp that fights is not reported.
     if (player->IsInCombat())
     {
+        // Set the sticky flag before resetting: ResetGatherWindow clears it, and the
+        // "this window is not a pure gathering loop" fact has to survive the restart.
+        ctx.gather.recentCombatSeen = true;
         ResetGatherWindow(player, ctx, "in-combat");
+        ctx.gather.recentCombatSeen = true;
         return;
     }
 
@@ -2229,6 +2239,7 @@ void AcAegisMgr::TouchGatherWindow(Player* player, AegisPlayerContext& ctx, char
     }
 
     float moved = Dist3DToPoint(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), ctx.gather.startX, ctx.gather.startY, ctx.gather.startZ);
+    ctx.gather.maxMoveInWindow = std::max(ctx.gather.maxMoveInWindow, moved);
     if (moved > (cfg.afkMaxMoveDistance * 2.0f))
     {
         ResetGatherWindow(player, ctx, source);
@@ -3169,15 +3180,32 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectAfk(Player* player, AegisPla
     if (!movementCtx.isAlive || movementCtx.isInCombat || movementCtx.isTaxiFlight || movementCtx.hasTransport || movementCtx.hasVehicle)
         return std::nullopt;
 
+    // This realm does not allow camping a spawn point, so a character that never
+    // leaves one spot across the whole window is the violation, and the check must
+    // clear it rather than block it. Two window-wide facts decide that:
+    //  - maxMoveInWindow is the largest distance reached at any counted action. A
+    //    normal player gathering across a zone travels well past afkMaxMoveDistance,
+    //    which resets the window anyway; using the running maximum (not the current
+    //    position) means "gather, step away, come back" cannot hide behind a small
+    //    final distance;
+    //  - recentCombatSeen records that the player was in combat at a counted action,
+    //    so killing a mob that wandered into the camp still disqualifies that window.
+    if (!movementCtx.isAlive || movementCtx.isTaxiFlight || movementCtx.hasTransport || movementCtx.hasVehicle)
+        return std::nullopt;
+
     float moved = Dist3DToPoint(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), ctx.gather.startX, ctx.gather.startY, ctx.gather.startZ);
     if (moved > cfg.afkMaxMoveDistance)
+        return std::nullopt;
+
+    bool campedInPlace = ctx.gather.maxMoveInWindow <= cfg.afkCampStationaryEpsilon;
+    if (!campedInPlace || ctx.gather.recentCombatSeen)
         return std::nullopt;
 
     AegisEvidenceEvent evidence;
     evidence.cheatType = AegisCheatType::Afk;
     evidence.level = (ctx.gather.actionCount >= cfg.afkStrongActions && moved <= cfg.afkStrongMoveDistance) ? AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
     evidence.tag = "GatherLoop";
-    evidence.detail = "actions=" + std::to_string(ctx.gather.actionCount) + ",gather=" + std::to_string(ctx.gather.gatherCount) + ",loot=" + std::to_string(ctx.gather.lootCount) + ",moved=" + std::to_string(moved);
+    evidence.detail = "actions=" + std::to_string(ctx.gather.actionCount) + ",gather=" + std::to_string(ctx.gather.gatherCount) + ",loot=" + std::to_string(ctx.gather.lootCount) + ",moved=" + std::to_string(moved) + ",maxMoved=" + std::to_string(ctx.gather.maxMoveInWindow);
     evidence.riskDelta = ClampRiskDelta(6.0f + std::min(18.0f, static_cast<float>(ctx.gather.actionCount) * 0.8f));
     evidence.serverMs = nowMs;
     evidence.metricA = static_cast<float>(ctx.gather.actionCount);

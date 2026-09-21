@@ -196,6 +196,7 @@ void AcAegisConfig::Reload()
     _config.afkMinSuspiciousWindows = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Afk.MinSuspiciousWindows", 2);
     _config.afkEvidenceCooldownMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Afk.EvidenceCooldownMs", 300000);
     _config.afkIgnoreActionGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.Afk.IgnoreActionGraceMs", 120000);
+    _config.afkCampStationaryEpsilon = sConfigMgr->GetOption<float>("AcAegis.Detector.Afk.CampStationaryEpsilon", 0.25f);
     _config.afkIgnoreSpellIds = ParseIdList(sConfigMgr->GetOption<std::string>("AcAegis.Detector.Afk.IgnoreSpellIds", ""));
     _config.afkIgnoreAuras = ParseIdList(sConfigMgr->GetOption<std::string>("AcAegis.Detector.Afk.IgnoreAuras", ""));
 
@@ -370,6 +371,8 @@ void AcAegisConfig::Reload()
     _config.afkMinSuspiciousWindows = std::max<uint32>(1, _config.afkMinSuspiciousWindows);
     _config.afkEvidenceCooldownMs = std::max<uint32>(1000, _config.afkEvidenceCooldownMs);
     _config.afkIgnoreActionGraceMs = std::max<uint32>(0, _config.afkIgnoreActionGraceMs);
+    _config.afkCampStationaryEpsilon = std::clamp(_config.afkCampStationaryEpsilon, 0.0f,
+        std::max(0.0f, _config.afkMaxMoveDistance - 0.05f));
 
     _config.notifyThreshold = std::max(0.0f, _config.notifyThreshold);
     _config.rollbackThreshold = std::max(_config.notifyThreshold, _config.rollbackThreshold);

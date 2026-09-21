@@ -164,6 +164,18 @@ To release every currently punished player immediately, use `.aegis purge`
   movement/geometry families; the behavioral gather heuristic stays fully gated,
   and bans still additionally require `Ban.StrongEvidenceRequired` and
   `Ban.MinOffenseCount`, so a first Strong event can reach at most Kick.
+- The AFK detector fires when a character never leaves one spot across the whole
+  window. That is deliberate policy on this realm: camping a spawn point is not
+  allowed, so standing still is itself the violation, and the detector must clear it
+  rather than block it. Two window-wide facts keep it off legitimate play:
+  `maxMoveInWindow` is the largest distance reached at any counted action (not the
+  final position), so "gather, step away, come back" cannot hide; and being in combat
+  at a counted action marks the window as not a pure gathering loop. A player who
+  gathers while travelling leaves `MaxMoveDistance`, which resets the window entirely.
+- `.aegis delete` and `.aegis purge` wait at most 5 seconds for the queued event rows
+  to be handed to the asynchronous queue. On expiry the command still runs and logs a
+  warning naming the guid and the timeout, so the operator is told the delete may not
+  have covered rows still in flight rather than being left to assume it did.
 - The detection state is only reset when a real movement boundary changes.
   `AcAegis` used to reset it unconditionally from the shared
   `AnticheatSetUnderACKmount` hook, which the core calls from 28 sites including
