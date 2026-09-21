@@ -1,6 +1,7 @@
 #ifndef MOD_AC_AEGIS_MGR_H
 #define MOD_AC_AEGIS_MGR_H
 
+#include <deque>
 #include <optional>
 #include <unordered_map>
 
@@ -32,6 +33,7 @@ struct AegisMovementContext
     bool hasWaterWalkAura = false;
     bool hasGhostAura = false;
     bool hasHoverAura = false;
+    bool hasFallMitigationAura = false;
     bool hasAfkIgnoreAura = false;
     bool recentSpellGrace = false;
     bool recentTeleportGrace = false;
@@ -45,7 +47,9 @@ struct AegisMovementContext
     bool recentControlledJumpGrace = false;
     bool recentControlledPullGrace = false;
     bool recentFallGrace = false;
-    bool recentKnockBackGrace = false;
+    // Server-issued displacement (knockback / pull / charge / jump / spell teleport).
+    // Only the passive anticheat hook can set this, never a client packet.
+    bool recentServerForceMoveGrace = false;
     bool recentServerCanFly = false;
     bool recentMountAck = false;
     bool recentMountGrace = false;
@@ -64,14 +68,15 @@ public:
 
     void ReloadConfig();
     bool GetPlayerDebugSnapshot(uint32 guidLow, AegisPlayerDebugSnapshot& outSnapshot) const;
-    void ClearPlayerOffense(Player* player);
-    void ClearPlayerOffense(uint32 guidLow);
+    void ClearPlayerOffense(Player* player, bool allowCoreBanClear);
+    void ClearPlayerOffense(uint32 guidLow, bool allowCoreBanClear);
     void DeletePlayerData(uint32 guidLow);
     void PurgeAllData();
 
     void OnLogin(Player* player);
     void OnLogout(Player* player);
     void OnWorldUpdate(uint32 diff);
+    void OnShutdown();
 
     void OnSpellCast(Player* player, Spell* spell, bool skipCheck);
     bool OnBeforeTeleport(Player* player, uint32 mapId, float x, float y, float z);
@@ -116,6 +121,8 @@ private:
     void Touch(Player* player);
     bool IsEnabledFor(Player* player) const;
     bool CanSafelyTeleportForPunish(Player* player) const;
+    bool GetGroundHeightCached(Player* player, AegisPlayerContext& ctx,
+        float x, float y, float z, float& groundZ) const;
     AegisMovementContext BuildMovementContext(Player* player, AegisPlayerContext const& ctx, uint32 nowMs) const;
     bool HasWhitelistedAura(AegisMovementContext const& movementCtx) const;
     bool ShouldSkipAllMovementDetectors(AegisMovementContext const& movementCtx) const;
@@ -142,8 +149,11 @@ private:
     std::optional<AegisEvidenceEvent> DetectAfk(Player* player, AegisPlayerContext& ctx, AegisMovementContext const& movementCtx) const;
 
     bool HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEvidenceEvent const& evidence);
+    bool RunMovementDetectors(Player* player, AegisPlayerContext& ctx, AegisMovementContext const& movementCtx);
     AegisActionDecision DetermineAction(Player* player, AegisPlayerContext const& ctx, AegisEvidenceEvent const& evidence) const;
     bool ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvidenceEvent const& evidence, AegisActionDecision const& decision);
+    bool QueuePendingAction(Player* player, AegisEvidenceEvent const& evidence, AegisActionDecision const& decision);
+    void ProcessPendingActions();
     void NotifyGms(Player* player, AegisEvidenceEvent const& evidence, AegisPlayerContext const& ctx) const;
     void Rollback(Player* player, AegisPlayerContext& ctx) const;
     void ApplyDebuff(Player* player) const;
@@ -166,6 +176,7 @@ private:
     uint32 _summaryElapsedMs = 0;
     uint32 _offlinePunishSweepElapsedMs = 0;
     ContextMap _players;
+    std::deque<AegisPendingAction> _pendingActions;
     AcAegisGeometry _geometry;
     AcAegisPersistence _persistence;
 };

@@ -112,5 +112,68 @@ Notes:
 - Event rows are queued and written to the characters database in background
   batches with a bounded queue, instead of synchronously inserting one row per
   detection on the hot path.
-- Punishment world broadcasts are now controlled by a dedicated config switch
-  and remain enabled by default.
+- Punishment world broadcasts are controlled by a dedicated config switch, remain
+  enabled by default, and use the configurable
+  `AcAegis.AutoAction.Broadcast.Format` template.
+
+## Detection, punishment and the enabled switch
+
+AcAegis.Enabled only gates **new detection**:
+
+- with the switch off no new evidence is produced, no new offense is recorded and
+  no new punishment is started;
+- a punishment that is already in its cycle keeps running until it expires,
+  including across a relog: an active debuff is re-applied on login, an active
+  jail sentence is restored and its escape teleports stay blocked, and an expired
+  temporary ban is still lifted by the offline sweep.
+
+To release every currently punished player immediately, use `.aegis purge`
+(administrator) or clear the `ac_aegis_offense` table by hand. Flipping
+`AcAegis.Enabled` is not an emergency stop for active punishments by design.
+
+## Detection quality notes
+
+- Punishment is decided while the evidence is produced but **executed on the next
+  world update**, so debuffs, teleports and kicks never run inside a loot,
+  gathering or movement callback. At most one punishment per player is executed
+  per tick.
+- The rollback target is recorded only from samples that produced no evidence, so
+  `Rollback` moves the player back to the last clean position instead of
+  re-teleporting them onto the flagged one.
+- Graces are scoped: the mount and whitelisted-spell graces only silence the
+  aerial/mount detectors, and the server-issued displacement grace (charge, jump,
+  knockback, pull, spell teleport) comes from the passive anticheat hook rather
+  than from a client acknowledgement.
+- Slow fall / feather fall auras no longer exempt a player from wall and door
+  clipping detection.
+- Root-break detection uses the server immobilisation state (`UNIT_STATE_ROOT`,
+  stun, root aura). `Player::IsRooted()` cannot be used because the core strips
+  `MOVEMENTFLAG_ROOT` from every client movement packet.
+- Ground lookups are cached per player (`AcAegis.Sampling.GroundCacheTtlMs`,
+  `AcAegis.Sampling.GroundCacheRadius`) because
+  `Map::GetFullTerrainStatusForPosition` is a VMAP-heavy query; set the TTL to 0
+  to disable the cache.
+- `AcAegis.Risk.OffenseTierFloor` lets the persistent offense ladder raise the
+  punishment floor for the current evidence. Without it the risk gate, which is
+  in practice an event-rate gate, cancels every prior-tier promotion and
+  intermittent cheaters are never escalated.
+- Geometry uses the real collision hit position from
+  `MapCollisionData::GetStaticTree()/GetDynamicTree()`, so
+  `AcAegis.Detector.NoClip.MinRemainingDistance` measures the real distance from
+  the hit point to the destination.
+
+## GM command security
+
+- `.aegis clear` is available to gamemasters and clears the accumulated offense,
+  the debuff and the jail sentence. Lifting the underlying core (BanMgr) ban
+  requires SEC_ADMINISTRATOR.
+- `.aegis delete` and `.aegis purge` require SEC_ADMINISTRATOR and also lift the
+  core bans Aegis recorded. Ban state is only cleared when the stored ban mode is
+  known, so an unrelated manual ban is never removed by accident.
+
+## Shutdown behaviour
+
+The background event writer and the file log appender are stopped from
+`WORLDHOOK_ON_SHUTDOWN`, which runs before `CharacterDatabase.Close()`. Queued
+event rows are handed to the asynchronous character database queue and buffered
+log lines are flushed while the database is still open.

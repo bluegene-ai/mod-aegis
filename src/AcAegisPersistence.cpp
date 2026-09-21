@@ -15,10 +15,41 @@
 
 namespace
 {
-    std::string EscapeForCharacterDb(std::string value)
+    // SQL literal escaping done locally on purpose: CharacterDatabase.EscapeString()
+    // reaches into the synchronous connection pool without locking, and the event
+    // writer runs on its own thread. Doubling single quotes stays correct even when
+    // the server runs with NO_BACKSLASH_ESCAPES.
+    std::string EscapeForCharacterDb(std::string const& value)
     {
-        CharacterDatabase.EscapeString(value);
-        return value;
+        std::string result;
+        result.reserve(value.size() + 8);
+
+        for (char ch : value)
+        {
+            switch (ch)
+            {
+            case '\'':
+                result += "''";
+                break;
+            case '\\':
+                result += "\\\\";
+                break;
+            case '\n':
+                result += "\\n";
+                break;
+            case '\r':
+                result += "\\r";
+                break;
+            case '\x1a':
+                result += "\\Z";
+                break;
+            default:
+                result += ch;
+                break;
+            }
+        }
+
+        return result;
     }
 
     void LoadOffenseRecordFromFields(Field* field, AegisOffenseRecord& outRecord)
@@ -59,6 +90,9 @@ namespace
         {
             {
                 std::lock_guard<std::mutex> lock(_mutex);
+                if (_stopping)
+                    return;
+
                 if (_queue.size() >= sAcAegisConfig->GetEventQueueLimit())
                 {
                     ++_droppedCount;
@@ -77,6 +111,9 @@ namespace
         void Barrier()
         {
             std::unique_lock<std::mutex> lock(_mutex);
+            if (_stopping)
+                return;
+
             uint64 targetSequence = _nextSequence;
             if (targetSequence == 0 || _completedSequence >= targetSequence)
                 return;
@@ -87,7 +124,7 @@ namespace
             _condition.notify_one();
             _condition.wait(lock, [this, targetSequence]()
             {
-                return _completedSequence >= targetSequence;
+                return _completedSequence >= targetSequence || _stopping;
             });
         }
 
@@ -109,7 +146,8 @@ namespace
             _queue.clear();
         }
 
-    private:
+        // Idempotent. Safe to call both from the world shutdown hook and from the
+        // static destructor; only the first call does the work.
         void Shutdown()
         {
             {
@@ -120,11 +158,12 @@ namespace
                 _stopping = true;
             }
 
-            _condition.notify_one();
+            _condition.notify_all();
             if (_worker.joinable())
                 _worker.join();
         }
 
+    private:
         void Run()
         {
             for (;;)
@@ -224,7 +263,11 @@ namespace
                     << ')';
             }
 
-            CharacterDatabase.DirectExecute(sql.str());
+            // CharacterDatabase.Execute() hands the statement to the asynchronous
+            // pool, which is the supported way to write from a non-world thread.
+            // DirectExecute() would take the single *synchronous* connection the
+            // world thread uses and busy-wait for it.
+            CharacterDatabase.Execute(sql.str());
         }
 
         void CompleteBatch(std::vector<QueuedEventRecord> const& batch)
@@ -418,6 +461,11 @@ void AcAegisPersistence::DeleteOffense(uint32 guidLow) const
 
 void AcAegisPersistence::DeletePlayerData(uint32 guidLow) const
 {
+    // Barrier() first so every event row enqueued before this point is already handed
+    // to the character database queue, then drop our own still-queued rows, then
+    // delete. Ordering between the INSERTs and the DELETE relies on the asynchronous
+    // pool being FIFO, which is the case with the default
+    // CharacterDatabase.WorkerThreads = 1.
     GetAsyncEventWriter().Barrier();
     GetAsyncEventWriter().DropQueuedForGuid(guidLow);
     CharacterDatabase.Execute(
@@ -430,6 +478,13 @@ void AcAegisPersistence::PurgeAllData() const
 {
     GetAsyncEventWriter().Barrier();
     GetAsyncEventWriter().DropAllQueued();
-    CharacterDatabase.Execute("TRUNCATE TABLE ac_aegis_event");
-    CharacterDatabase.Execute("TRUNCATE TABLE ac_aegis_offense");
+    // DELETE instead of TRUNCATE: TRUNCATE requires the DROP privilege, which many
+    // production character accounts deliberately do not have.
+    CharacterDatabase.Execute("DELETE FROM ac_aegis_event");
+    CharacterDatabase.Execute("DELETE FROM ac_aegis_offense");
+}
+
+void AcAegisPersistence::Shutdown() const
+{
+    GetAsyncEventWriter().Shutdown();
 }

@@ -87,14 +87,22 @@ void AcAegisGeometry::SanitizeGroundHeight(Player* player, float x, float y, flo
 bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
     float startX, float startY, float startZ,
     float endX, float endY, float endZ,
-    float& hitX, float& hitY, float& hitZ) const
+    float& hitX, float& hitY, float& hitZ,
+    bool* hitPointValid) const
 {
     Map* map = player ? player->GetMap() : nullptr;
     if (!player || !player->IsInWorld() || !map)
+    {
+        if (hitPointValid)
+            *hitPointValid = false;
+
         return false;
+    }
+
+    AegisConfig const& cfg = sAcAegisConfig->Get();
 
     LineOfSightChecks checks = LINEOFSIGHT_CHECK_GOBJECT_ALL;
-    if (sAcAegisConfig->Get().useVmaps)
+    if (cfg.useVmaps)
         checks = LineOfSightChecks(checks | LINEOFSIGHT_CHECK_VMAP);
 
     bool clear = map->isInLineOfSight(
@@ -105,11 +113,81 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
         VMAP::ModelIgnoreFlags::Nothing);
 
     if (clear)
-        return false;
+    {
+        if (hitPointValid)
+            *hitPointValid = false;
 
-    hitX = (startX + endX) * 0.5f;
-    hitY = (startY + endY) * 0.5f;
-    hitZ = (startZ + endZ) * 0.5f;
+        return false;
+    }
+
+    // The line of sight test above only answers yes/no. Resolve the real hit
+    // position from the same collision trees so callers no longer have to treat a
+    // synthetic midpoint as if it were a hit point.
+    bool found = false;
+    float bestX = 0.0f;
+    float bestY = 0.0f;
+    float bestZ = 0.0f;
+    float bestDistSq = std::numeric_limits<float>::max();
+
+    auto considerHit = [&](float candidateX, float candidateY, float candidateZ, bool valid)
+    {
+        if (!valid)
+            return;
+
+        float dx = candidateX - startX;
+        float dy = candidateY - startY;
+        float dz = candidateZ - startZ;
+        float distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq < bestDistSq)
+        {
+            bestDistSq = distSq;
+            bestX = candidateX;
+            bestY = candidateY;
+            bestZ = candidateZ;
+            found = true;
+        }
+    };
+
+    if (cfg.useVmaps)
+    {
+        float staticX = 0.0f;
+        float staticY = 0.0f;
+        float staticZ = 0.0f;
+        bool staticHit = map->GetMapCollisionData().GetStaticTree().GetObjectHitPos(
+            startX, startY, startZ, endX, endY, endZ,
+            staticX, staticY, staticZ, 0.0f);
+        considerHit(staticX, staticY, staticZ, staticHit);
+    }
+
+    {
+        float dynamicX = 0.0f;
+        float dynamicY = 0.0f;
+        float dynamicZ = 0.0f;
+        bool dynamicHit = map->GetMapCollisionData().GetDynamicTree().GetObjectHitPos(
+            player->GetPhaseMask(),
+            startX, startY, startZ, endX, endY, endZ,
+            dynamicX, dynamicY, dynamicZ, 0.0f);
+        considerHit(dynamicX, dynamicY, dynamicZ, dynamicHit);
+    }
+
+    if (found)
+    {
+        hitX = bestX;
+        hitY = bestY;
+        hitZ = bestZ;
+    }
+    else
+    {
+        // No tree reported a position even though the line was blocked. Fall back to
+        // the segment midpoint and tell the caller the value is an approximation.
+        hitX = (startX + endX) * 0.5f;
+        hitY = (startY + endY) * 0.5f;
+        hitZ = (startZ + endZ) * 0.5f;
+    }
+
+    if (hitPointValid)
+        *hitPointValid = found;
+
     return true;
 }
 
@@ -131,7 +209,8 @@ AegisGeometryResult AcAegisGeometry::CheckShortSegment(Player* player,
     bool blocked = RaycastStaticAndDynamic(player,
         from.x, from.y, from.z + zOffset,
         to.x, to.y, to.z + zOffset,
-        hitX, hitY, hitZ);
+        hitX, hitY, hitZ,
+        &result.hitValid);
 
     float remainingDistance = 0.0f;
     if (blocked)
@@ -161,11 +240,11 @@ AegisGeometryResult AcAegisGeometry::CheckShortSegment(Player* player,
     result.hitY = hitY;
     result.hitZ = hitZ;
     if (rayBlocked)
-        result.reason = "segment-blocked";
+        result.reason = result.hitValid ? "segment-blocked" : "segment-blocked-approx";
     else if (!reachable)
         result.reason = "segment-unreachable";
     else if (blocked)
-        result.reason = "segment-hit-too-close";
+        result.reason = result.hitValid ? "segment-hit-too-close" : "segment-hit-too-close-approx";
     else
         result.reason = "segment-clear";
 

@@ -1,6 +1,7 @@
 #include "AcAegisMgr.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <ctime>
@@ -9,7 +10,9 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include "AccountMgr.h"
 #include "BanMgr.h"
@@ -90,21 +93,7 @@ namespace
             Enqueue(path, line, false);
         }
 
-    private:
-        void Enqueue(std::string const& path, std::string const& line,
-            bool prepareOnly)
-        {
-            if (path.empty())
-                return;
-
-            {
-                std::lock_guard<std::mutex> lock(_mutex);
-                _queue.push_back({ path, line, prepareOnly });
-            }
-
-            _condition.notify_one();
-        }
-
+        // Idempotent. Called from the world shutdown hook and from the destructor.
         void Shutdown()
         {
             {
@@ -120,6 +109,59 @@ namespace
                 _worker.join();
 
             FlushAll();
+        }
+
+    private:
+        // The event queue has a hard limit; the log queue used to be unbounded, so a
+        // verbose log burst could grow memory without limit.
+        static constexpr size_t kQueueLimit = 8192;
+
+        void Enqueue(std::string const& path, std::string const& line,
+            bool prepareOnly)
+        {
+            if (path.empty())
+                return;
+
+            bool dropped = false;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_stopping)
+                    return;
+
+                if (_queue.size() >= kQueueLimit)
+                {
+                    ++_droppedCount;
+                    dropped = true;
+                }
+                else
+                    _queue.push_back({ path, line, prepareOnly });
+            }
+
+            if (dropped)
+            {
+                MaybeLogDropped();
+                return;
+            }
+
+            _condition.notify_one();
+        }
+
+        void MaybeLogDropped()
+        {
+            uint32 dropped = 0;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                auto now = std::chrono::steady_clock::now();
+                if ((now - _lastDropLogAt) < std::chrono::seconds(10))
+                    return;
+
+                dropped = _droppedCount;
+                _droppedCount = 0;
+                _lastDropLogAt = now;
+            }
+
+            if (dropped > 0)
+                LOG_WARN("module", "[AcAegis] Dropped {} log lines due to file log queue pressure", dropped);
         }
 
         void Run()
@@ -202,6 +244,8 @@ namespace
         std::deque<QueuedLogLine> _queue;
         std::unordered_map<std::string, std::ofstream> _streams;
         std::thread _worker;
+        std::chrono::steady_clock::time_point _lastDropLogAt = std::chrono::steady_clock::now();
+        uint32 _droppedCount = 0;
         bool _stopping = false;
     };
 
@@ -209,6 +253,11 @@ namespace
     {
         static AsyncFileAppender appender;
         return appender;
+    }
+
+    void ShutdownAsyncFileAppender()
+    {
+        GetAsyncFileAppender().Shutdown();
     }
 
     bool ShouldCountOffenseForPunishStage(AegisPunishStage stage,
@@ -376,6 +425,10 @@ namespace
         return markMs && nowMs >= markMs && (nowMs - markMs) <= graceMs;
     }
 
+    // Aura types that authorize being airborne: fly, hover and mounted flight speed.
+    // Feather fall / safe fall are deliberately NOT part of this set. They only slow a
+    // descent; treating them as "authorized aerial state" used to exempt the player
+    // from wall/door clipping detection for the whole aura duration.
     bool IsServerAuthorizedAerialAura(Aura const* aura)
     {
         if (!aura)
@@ -387,16 +440,45 @@ namespace
 
         if (aura->HasEffectType(SPELL_AURA_FLY) ||
             aura->HasEffectType(SPELL_AURA_HOVER) ||
-            aura->HasEffectType(SPELL_AURA_FEATHER_FALL) ||
-            aura->HasEffectType(SPELL_AURA_SAFE_FALL) ||
             aura->HasEffectType(SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED))
             return true;
 
         return spellInfo->HasAura(SPELL_AURA_FLY) ||
             spellInfo->HasAura(SPELL_AURA_HOVER) ||
-            spellInfo->HasAura(SPELL_AURA_FEATHER_FALL) ||
-            spellInfo->HasAura(SPELL_AURA_SAFE_FALL) ||
             spellInfo->HasAura(SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED);
+    }
+
+    bool IsFallMitigationAura(Aura const* aura)
+    {
+        if (!aura)
+            return false;
+
+        SpellInfo const* spellInfo = aura->GetSpellInfo();
+        if (!spellInfo)
+            return false;
+
+        if (aura->HasEffectType(SPELL_AURA_FEATHER_FALL) ||
+            aura->HasEffectType(SPELL_AURA_SAFE_FALL))
+            return true;
+
+        return spellInfo->HasAura(SPELL_AURA_FEATHER_FALL) ||
+            spellInfo->HasAura(SPELL_AURA_SAFE_FALL);
+    }
+
+    bool HasFallMitigationAura(Player* player)
+    {
+        if (!player)
+            return false;
+
+        for (auto const& [spellId, aurApp] : player->GetAppliedAuras())
+        {
+            (void)spellId;
+
+            if (aurApp && IsFallMitigationAura(aurApp->GetBase()))
+                return true;
+        }
+
+        return false;
     }
 
     bool IsServerAuthorizedAerialState(Player* player)
@@ -695,6 +777,22 @@ namespace
         return (moveFlags & (MOVEMENTFLAG_FLYING | MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_HOVER)) != 0;
     }
 
+    // Server side immobilisation. Player::IsRooted() cannot be used for this: the
+    // core strips MOVEMENTFLAG_ROOT from every client movement packet
+    // (WorldSession::ReadMovementInfo) and Unit::SendMoveRoot only mirrors the flag
+    // into m_movementInfo for units that are not controlled by a client, so it is
+    // always false for players. The unit state / aura checks below reflect the real
+    // server state.
+    bool IsServerImmobilized(Player* player)
+    {
+        if (!player)
+            return false;
+
+        return player->IsImmobilizedState() ||
+            player->HasRootAura() ||
+            player->HasStunAura();
+    }
+
     bool HasActiveMovementIntent(uint32 moveFlags)
     {
         return (moveFlags & (MOVEMENTFLAG_MASK_MOVING |
@@ -802,12 +900,12 @@ namespace
         ctx.lastTaxiFlightMs = 0;
         ctx.lastFallMs = 0;
         ctx.lastCanFlyServerMs = 0;
-        ctx.lastAckMountMs = 0;
+        ctx.lastMountAckMs = 0;
+        ctx.lastServerForceMoveMs = 0;
         ctx.lastControlledTeleportMs = 0;
         ctx.lastControlledChargeMs = 0;
         ctx.lastControlledJumpMs = 0;
         ctx.lastControlledPullMs = 0;
-        ctx.lastKnockBackAckMs = 0;
         ctx.lastRootAckMs = 0;
         ctx.lastJumpOpcodeMs = 0;
         ctx.lastJailReturnCheckMs = 0;
@@ -816,6 +914,7 @@ namespace
         ctx.observedTaxiFlightState = false;
         ctx.observedTransportState = false;
         ctx.observedVehicleState = false;
+        ctx.groundCacheValid = false;
         ctx.gather = AegisGatherState{};
         ClearPendingTeleportExpectation(ctx);
     }
@@ -1049,6 +1148,53 @@ bool AcAegisMgr::CanSafelyTeleportForPunish(Player* player) const
         !player->IsInFlight();
 }
 
+bool AcAegisMgr::GetGroundHeightCached(Player* player, AegisPlayerContext& ctx,
+    float x, float y, float z, float& groundZ) const
+{
+    AegisConfig const& cfg = sAcAegisConfig->Get();
+    uint32 nowMs = _elapsedMs;
+    uint32 mapId = player ? player->GetMapId() : 0;
+
+    if (cfg.groundCacheTtlMs > 0 && ctx.groundCacheValid && ctx.groundCacheMapId == mapId &&
+        nowMs >= ctx.groundCacheMs && (nowMs - ctx.groundCacheMs) <= cfg.groundCacheTtlMs)
+    {
+        float dx = x - ctx.groundCacheX;
+        float dy = y - ctx.groundCacheY;
+        float dz = z - ctx.groundCacheZ;
+        float radius = cfg.groundCacheRadius;
+        if ((dx * dx + dy * dy) <= (radius * radius) &&
+            std::fabs(dz) <= std::max(1.0f, radius))
+        {
+            groundZ = ctx.groundCacheGroundZ;
+            return true;
+        }
+    }
+
+    float queriedGroundZ = z;
+    if (!_geometry.GetGroundHeight(player, x, y, z, queriedGroundZ))
+    {
+        ctx.groundCacheValid = false;
+        return false;
+    }
+
+    groundZ = queriedGroundZ;
+
+    if (cfg.groundCacheTtlMs > 0)
+    {
+        ctx.groundCacheValid = true;
+        ctx.groundCacheMs = nowMs;
+        ctx.groundCacheMapId = mapId;
+        ctx.groundCacheX = x;
+        ctx.groundCacheY = y;
+        ctx.groundCacheZ = z;
+        ctx.groundCacheGroundZ = queriedGroundZ;
+    }
+    else
+        ctx.groundCacheValid = false;
+
+    return true;
+}
+
 AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlayerContext const& ctx, uint32 nowMs) const
 {
     AegisMovementContext movementCtx;
@@ -1076,6 +1222,7 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.hasWaterWalkAura = player->HasWaterWalkAura();
     movementCtx.hasGhostAura = player->HasGhostAura();
     movementCtx.hasHoverAura = player->HasHoverAura();
+    movementCtx.hasFallMitigationAura = HasFallMitigationAura(player);
 
     movementCtx.hasConfiguredAuraWhitelist = HasConfiguredAuraWhitelist(player);
 
@@ -1100,8 +1247,8 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.recentControlledJumpGrace = IsRecentTimestamp(nowMs, ctx.lastControlledJumpMs, cfg.mobilitySpellGraceMs);
     movementCtx.recentControlledPullGrace = IsRecentTimestamp(nowMs, ctx.lastControlledPullMs, cfg.forceMoveGraceMs);
     movementCtx.recentServerCanFly = ctx.serverCanFly && IsRecentTimestamp(nowMs, ctx.lastCanFlyServerMs, cfg.flyCanFlyGraceMs);
-    movementCtx.recentMountAck = IsRecentTimestamp(nowMs, ctx.lastAckMountMs, cfg.flyCanFlyGraceMs);
-    movementCtx.recentMountGrace = IsRecentTimestamp(nowMs, ctx.lastAckMountMs, cfg.mountGraceMs);
+    movementCtx.recentMountAck = IsRecentTimestamp(nowMs, ctx.lastMountAckMs, cfg.flyCanFlyGraceMs);
+    movementCtx.recentMountGrace = IsRecentTimestamp(nowMs, ctx.lastMountAckMs, cfg.mountGraceMs);
     movementCtx.recentAerialExitGrace =
         !movementCtx.hasAuthorizedAerialState &&
         IsRecentTimestamp(nowMs, ctx.lastAuthorizedAerialMs,
@@ -1111,7 +1258,10 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
     movementCtx.recentFall = IsRecentTimestamp(nowMs, ctx.lastFallMs, cfg.fallGraceMs);
     movementCtx.recentFallGrace = movementCtx.recentFall &&
         (!ctx.lastJumpOpcodeMs || nowMs < ctx.lastJumpOpcodeMs || (nowMs - ctx.lastJumpOpcodeMs) > (cfg.superJumpWindowMs + 300));
-    movementCtx.recentKnockBackGrace = cfg.forceMoveEnabled && IsRecentTimestamp(nowMs, ctx.lastKnockBackAckMs, cfg.forceMoveGraceMs);
+    // Server-issued displacement only. A client-forged CMSG_MOVE_KNOCK_BACK_ACK no
+    // longer buys a detection grace window.
+    movementCtx.recentServerForceMoveGrace = cfg.forceMoveEnabled &&
+        IsRecentTimestamp(nowMs, ctx.lastServerForceMoveMs, cfg.forceMoveGraceMs);
 
     movementCtx.shouldSkipAllDetectors =
         movementCtx.isBeingTeleported ||
@@ -1132,7 +1282,7 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
         movementCtx.recentRootAckGrace ||
         movementCtx.recentFallGrace ||
         movementCtx.recentAerialExitGrace ||
-        movementCtx.recentKnockBackGrace;
+        movementCtx.recentServerForceMoveGrace;
 
     movementCtx.shouldSkipAerialDetectors =
         movementCtx.shouldSkipAllDetectors ||
@@ -1140,6 +1290,7 @@ AegisMovementContext AcAegisMgr::BuildMovementContext(Player* player, AegisPlaye
         movementCtx.hasWaterWalkAura ||
         movementCtx.hasHoverAura ||
         movementCtx.hasGhostAura ||
+        movementCtx.hasFallMitigationAura ||
         movementCtx.recentServerCanFly ||
         movementCtx.recentMountAck;
 
@@ -1222,7 +1373,6 @@ void AcAegisMgr::CaptureSample(Player* player, MovementInfo const& movementInfo,
 
     ctx.samples.Push(sample);
     ctx.lastSeenMs = _elapsedMs;
-    MaybeUpdateSafePosition(player, ctx, sample);
 }
 
 std::optional<AegisEvidenceEvent> AcAegisMgr::DetectTime(Player* /*player*/, AegisPlayerContext& ctx) const
@@ -1339,7 +1489,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectRootBreak(Player* player,
     MovementInfo const& movementInfo, AegisPlayerContext& ctx,
     AegisMovementContext const& movementCtx) const
 {
-    if (!player || !player->IsRooted())
+    if (!player || !IsServerImmobilized(player))
         return std::nullopt;
 
     if (movementCtx.isBeingTeleported || movementCtx.isTaxiFlight ||
@@ -1349,10 +1499,13 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectRootBreak(Player* player,
         movementCtx.recentControlledJumpGrace ||
         movementCtx.recentControlledPullGrace ||
         movementCtx.recentControlledTeleportGrace ||
-        movementCtx.recentKnockBackGrace)
+        movementCtx.recentServerForceMoveGrace)
         return std::nullopt;
 
-    bool hasRootFlag = movementInfo.HasMovementFlag(MOVEMENTFLAG_ROOT);
+    // The client supplied MOVEMENTFLAG_ROOT is stripped by
+    // WorldSession::ReadMovementInfo, so the packet can never carry it. The useful
+    // signal is the opposite one: the server says this unit is immobilised while the
+    // packet claims movement or reports a displaced position.
     bool claimsMoving = movementInfo.HasMovementFlag(MOVEMENTFLAG_MASK_MOVING);
     float dist2d = Dist3DToPoint(movementInfo.pos.GetPositionX(),
         movementInfo.pos.GetPositionY(), player->GetPositionZ(),
@@ -1360,16 +1513,18 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectRootBreak(Player* player,
     float deltaZ = std::fabs(movementInfo.pos.GetPositionZ() -
         player->GetPositionZ());
 
-    if (!claimsMoving && hasRootFlag && dist2d < 0.15f && deltaZ < 0.15f)
+    // Turning in place and heartbeat packets while rooted stay silent on purpose:
+    // only a movement claim or an actual position change is evidence.
+    if (!claimsMoving && dist2d < 0.5f && deltaZ < 0.5f)
         return std::nullopt;
 
     AegisEvidenceEvent evidence;
     evidence.cheatType = AegisCheatType::Control;
-    evidence.level = (!hasRootFlag || dist2d >= 1.0f || deltaZ >= 0.75f) ?
+    evidence.level = (claimsMoving || dist2d >= 1.0f || deltaZ >= 0.75f) ?
         AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
     evidence.tag = "RootBreak";
     evidence.detail = "moving=" + std::to_string(claimsMoving ? 1 : 0) +
-        ",rootFlag=" + std::to_string(hasRootFlag ? 1 : 0);
+        ",dist2d=" + std::to_string(dist2d);
     evidence.riskDelta = ClampRiskDelta(10.0f +
         (claimsMoving ? 6.0f : 0.0f) + std::min(8.0f, dist2d * 4.0f));
     evidence.serverMs = _elapsedMs;
@@ -1551,7 +1706,7 @@ void AcAegisMgr::MaybeUpdateSafePosition(Player* player, AegisPlayerContext& ctx
         return;
 
     float groundZ = 0.0f;
-    if (!_geometry.GetGroundHeight(player, sample.x, sample.y, sample.z, groundZ))
+    if (!GetGroundHeightCached(player, ctx, sample.x, sample.y, sample.z, groundZ))
         return;
 
     if (std::fabs(sample.z - groundZ) > 3.0f)
@@ -1559,6 +1714,7 @@ void AcAegisMgr::MaybeUpdateSafePosition(Player* player, AegisPlayerContext& ctx
 
     ctx.safePosition.valid = true;
     ctx.safePosition.mapId = sample.mapId;
+    ctx.safePosition.serverMs = _elapsedMs;
     ctx.safePosition.x = sample.x;
     ctx.safePosition.y = sample.y;
     ctx.safePosition.z = sample.z;
@@ -1983,6 +2139,15 @@ void AcAegisMgr::TouchGatherWindow(Player* player, AegisPlayerContext& ctx, char
     if (ctx.gather.lastActionMs && nowMs >= ctx.gather.lastActionMs && (nowMs - ctx.gather.lastActionMs) < cfg.afkMinActionGapMs)
         return;
 
+    // Looting or gathering while in combat means the player is actively fighting, not
+    // running a fixed-position farm loop. Restart the window instead of counting it,
+    // otherwise stationary AoE farming can drift towards the AFK threshold.
+    if (player->IsInCombat())
+    {
+        ResetGatherWindow(player, ctx, "in-combat");
+        return;
+    }
+
     if (ctx.gather.windowStartMs == 0)
     {
         ctx.gather.windowStartMs = nowMs;
@@ -2234,9 +2399,13 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
         ctx.noClipBlockedHits = 0;
     };
 
+    // Wall / door clipping is only excused by states that legitimately move the unit
+    // through geometry: taxi, transport, vehicle, a server granted can-fly or a fresh
+    // mount. Slow fall / feather fall auras are deliberately NOT in this list: they
+    // only slow a descent and used to disable clipping detection for their whole
+    // duration.
     if (movementCtx.isTaxiFlight || movementCtx.recentTaxiFlightGrace ||
         movementCtx.hasTransport || movementCtx.hasVehicle ||
-        movementCtx.hasAuthorizedAerialState ||
         movementCtx.recentServerCanFly || movementCtx.recentMountAck)
     {
         resetWindow();
@@ -2396,17 +2565,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectFly(Player* player, AegisPla
         return std::nullopt;
 
     float groundZ = 0.0f;
-    if (!_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, groundZ))
-        return std::nullopt;
-
-    if (HasUnstableGroundReference(player,
-            _geometry,
-            cur,
-            &prev,
-            groundZ,
-            std::max(2.0f, cfg.flySustainMinHorizontalDistance),
-            std::max(1.5f, cfg.climbMinRise),
-            std::max(20.0f, cfg.flyMinHeightAboveGround * 2.5f)))
+    if (!GetGroundHeightCached(player, ctx, cur.x, cur.y, cur.z, groundZ))
         return std::nullopt;
 
     float height = std::max(0.0f, cur.z - groundZ);
@@ -2420,6 +2579,38 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectFly(Player* player, AegisPla
     bool likelyDescending = riseZ <= 0.0f;
 
     if (recentFall && likelyDescending && !illegalFlags && !recentJump)
+        return std::nullopt;
+
+    // Every remaining branch requires either an unauthorized flight flag or a real
+    // height above ground. Bail out before the ground-stability raycast below, which
+    // used to run on every single ground movement packet for no benefit.
+    bool possibleEvidence =
+        (illegalFlags && (height >= cfg.flyIllegalFlagMinHeightAboveGround ||
+            dist2d >= cfg.flyIllegalFlagMinHorizontalDistance)) ||
+        height >= cfg.flyMinHeightAboveGround;
+    if (!possibleEvidence)
+    {
+        if (!illegalFlags)
+        {
+            ctx.flyWindowStartMs = 0;
+            ctx.flySuspicionHits = 0;
+        }
+
+        ctx.airStallWindowStartMs = 0;
+        ctx.airStallHits = 0;
+        return std::nullopt;
+    }
+
+    // Only consult the multi-floor stability heuristic once the segment could
+    // actually produce evidence; it costs another terrain query per call.
+    if (HasUnstableGroundReference(player,
+            _geometry,
+            cur,
+            &prev,
+            groundZ,
+            std::max(2.0f, cfg.flySustainMinHorizontalDistance),
+            std::max(1.5f, cfg.climbMinRise),
+            std::max(20.0f, cfg.flyMinHeightAboveGround * 2.5f)))
         return std::nullopt;
 
     float hitX = 0.0f;
@@ -2565,19 +2756,23 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectWaterWalk(Player* player, Ae
         return std::nullopt;
     }
 
-    float curGroundZ = 0.0f;
-    float prevGroundZ = 0.0f;
-    if (!_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, curGroundZ) ||
-        !_geometry.GetGroundHeight(player, prev.x, prev.y, prev.z, prevGroundZ))
+    // Cheap rejection first: Map::GetWaterLevel only needs the terrain grid, while
+    // GetGroundHeight goes through the VMAP-heavy
+    // Map::GetFullTerrainStatusForPosition. Without water in reach the segment cannot
+    // be water walking, so the ground queries are skipped entirely on dry land.
+    float curWaterLevel = player->GetMap()->GetWaterLevel(cur.x, cur.y);
+    float prevWaterLevel = player->GetMap()->GetWaterLevel(prev.x, prev.y);
+    if (curWaterLevel <= INVALID_HEIGHT || prevWaterLevel <= INVALID_HEIGHT)
     {
         ctx.waterWalkWindowStartMs = 0;
         ctx.waterWalkHits = 0;
         return std::nullopt;
     }
 
-    float curWaterLevel = player->GetMap()->GetWaterLevel(cur.x, cur.y);
-    float prevWaterLevel = player->GetMap()->GetWaterLevel(prev.x, prev.y);
-    if (curWaterLevel <= INVALID_HEIGHT || prevWaterLevel <= INVALID_HEIGHT)
+    float curGroundZ = 0.0f;
+    float prevGroundZ = 0.0f;
+    if (!GetGroundHeightCached(player, ctx, cur.x, cur.y, cur.z, curGroundZ) ||
+        !_geometry.GetGroundHeight(player, prev.x, prev.y, prev.z, prevGroundZ))
     {
         ctx.waterWalkWindowStartMs = 0;
         ctx.waterWalkHits = 0;
@@ -2775,10 +2970,12 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectClimb(Player* player, AegisP
         return std::nullopt;
 
     bool recentJump = movementCtx.recentJump;
-    if (recentJump)
+    // The super jump apex branch below only fires when the segment already climbed
+    // superJumpMinDeltaZ, so require that before paying for the terrain queries.
+    if (recentJump && deltaZ >= cfg.superJumpMinDeltaZ)
     {
         float groundZ = 0.0f;
-        if (_geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, groundZ))
+        if (GetGroundHeightCached(player, ctx, cur.x, cur.y, cur.z, groundZ))
         {
             if (HasUnstableGroundReference(player,
                     _geometry,
@@ -2846,7 +3043,7 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectClimb(Player* player, AegisP
     {
         float curGroundZ = 0.0f;
         float prevGroundZ = 0.0f;
-        bool haveCurGround = _geometry.GetGroundHeight(player, cur.x, cur.y, cur.z, curGroundZ);
+        bool haveCurGround = GetGroundHeightCached(player, ctx, cur.x, cur.y, cur.z, curGroundZ);
         bool havePrevGround = _geometry.GetGroundHeight(player, prev.x, prev.y, prev.z, prevGroundZ);
         if ((haveCurGround && (cur.z - curGroundZ) > cfg.flyMinHeightAboveGround) ||
             (havePrevGround && (prev.z - prevGroundZ) > cfg.flyMinHeightAboveGround))
@@ -2953,6 +3150,19 @@ void AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
         return;
     }
 
+    // The rollback target is only refreshed by samples that produced no evidence, so a
+    // sustained cheat run leaves it behind. Cap how far back a rollback may reach:
+    // beyond this age the teleport would move the player across the zone, which is not
+    // worth the risk on an unusual but legitimate movement pattern.
+    constexpr uint32 kMaxSafePositionAgeMs = 30000;
+    if (_elapsedMs >= ctx.safePosition.serverMs &&
+        (_elapsedMs - ctx.safePosition.serverMs) > kMaxSafePositionAgeMs)
+    {
+        WriteAuditLog("rollback_skipped", player, &ctx,
+            "\"reason\":\"safe-position-too-old\"");
+        return;
+    }
+
     if (ctx.safePosition.mapId == player->GetMapId())
         player->NearTeleportTo(ctx.safePosition.x, ctx.safePosition.y, ctx.safePosition.z, ctx.safePosition.o);
     else
@@ -2965,7 +3175,8 @@ void AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
           << ",\"targetX\":" << ctx.safePosition.x
           << ",\"targetY\":" << ctx.safePosition.y
           << ",\"targetZ\":" << ctx.safePosition.z
-          << ",\"targetO\":" << ctx.safePosition.o;
+          << ",\"targetO\":" << ctx.safePosition.o
+          << ",\"ageMs\":" << (_elapsedMs >= ctx.safePosition.serverMs ? _elapsedMs - ctx.safePosition.serverMs : 0);
     WriteAuditLog("rollback", player, &ctx, audit.str());
 }
 
@@ -3164,12 +3375,13 @@ bool AcAegisMgr::ClearCoreBanState(uint32 guidLow, uint32 accountId, std::string
     }
     else
     {
-        if (!characterName.empty())
-            cleared = sBan->RemoveBanCharacter(characterName) || cleared;
-        if (!accountName.empty())
-            cleared = sBan->RemoveBanAccount(accountName) || cleared;
-        else if (!characterName.empty())
-            cleared = sBan->RemoveBanAccountByPlayerName(characterName) || cleared;
+        // Unknown or missing ban mode. Do not guess: the previous behaviour removed
+        // both the character ban and the account ban, which could lift an unrelated
+        // manual ban that Aegis never issued.
+        LOG_WARN("module",
+            "[AcAegis] Refusing to clear core ban state for guid {} account {}: unknown ban mode '{}'",
+            guidLow, accountId, banMode);
+        return false;
     }
 
     return cleared;
@@ -3228,6 +3440,21 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
         RaisePunishStage(baseStage, ctx.punish.offenseTier, cfg) :
         baseStage;
     AegisPunishStage stageByRisk = RiskThresholdStage(ctx.riskScore, cfg);
+
+    // The risk gate is effectively an event rate gate: with the default half life and
+    // per-event cap a cheater who only trips a detector every ~30 seconds never builds
+    // enough risk, and ApplyRiskGate() would then cancel every prior-tier promotion,
+    // so the persistent offense ladder never advanced. Let history raise the floor,
+    // but only when the current evidence is at least Medium so a single noisy event
+    // can never be escalated by history alone.
+    if (cfg.offenseTierRiskFloor &&
+        cfg.offenseEnabled &&
+        evidence.level >= AegisEvidenceLevel::Medium &&
+        ctx.punish.offenseTier > 0)
+    {
+        stageByRisk = std::max(stageByRisk, StageFromTier(ctx.punish.offenseTier, cfg));
+    }
+
     AegisPunishStage finalStage = ApplyRiskGate(stageByEvidence, stageByRisk);
 
     uint32 pendingPunishOffenseCount =
@@ -3485,11 +3712,11 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
         if (!evidence.tag.empty())
             cheatLabel += "[" + evidence.tag + "]";
 
-        ChatHandler(nullptr).SendWorldText(
-            "玩家 |cffff0000{}|r 因 |cffff0000{}作弊|r，被 |cffff0000{}|r，请各位英雄引以为戒，规范游戏。",
-            playerName,
-            cheatLabel,
-            ActionTypeTextZh(announcedAction));
+        std::string broadcast = cfg.punishBroadcastFormat;
+        ReplaceAll(broadcast, "{player}", playerName);
+        ReplaceAll(broadcast, "{type}", cheatLabel);
+        ReplaceAll(broadcast, "{action}", ActionTypeTextZh(announcedAction));
+        ChatHandler(nullptr).SendWorldText(std::string_view(broadcast));
     }
 
     std::ostringstream audit;
@@ -3587,7 +3814,73 @@ bool AcAegisMgr::HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEv
           << (decision.persistOffense ? "true" : "false");
     WriteAuditLog("evidence", player, &ctx, audit.str());
 
-    return ExecuteAction(player, ctx, evidence, decision);
+    // Detection records and risk are applied immediately; the punishment itself is
+    // deferred to the next world update. Applying debuffs, teleports and kicks from
+    // inside a loot / gathering / movement callback re-enters those code paths.
+    return QueuePendingAction(player, evidence, decision);
+}
+
+bool AcAegisMgr::QueuePendingAction(Player* player, AegisEvidenceEvent const& evidence,
+    AegisActionDecision const& decision)
+{
+    if (!player)
+        return false;
+
+    // A pure observe decision has nothing to execute.
+    if (decision.primaryAction == AegisActionType::None &&
+        !decision.shouldNotify &&
+        !decision.shouldRollback)
+        return false;
+
+    static constexpr size_t kMaxPendingActions = 512;
+    if (_pendingActions.size() >= kMaxPendingActions)
+    {
+        WriteAuditLog("action_dropped", player, nullptr, "\"reason\":\"pending-queue-full\"");
+        return false;
+    }
+
+    AegisPendingAction pending;
+    pending.guidLow = player->GetGUID().GetCounter();
+    pending.queuedMs = _elapsedMs;
+    pending.evidence = evidence;
+    pending.decision = decision;
+    _pendingActions.push_back(std::move(pending));
+    return true;
+}
+
+void AcAegisMgr::ProcessPendingActions()
+{
+    if (_pendingActions.empty())
+        return;
+
+    // Bounded per tick so a burst can never stall the world update.
+    static constexpr size_t kMaxActionsPerTick = 16;
+
+    // At most one punishment per player per drain: a burst of evidence in the same
+    // tick must not re-apply the debuff / repeat the rollback / re-send the message.
+    std::vector<uint32> handledGuids;
+
+    size_t processed = 0;
+    while (!_pendingActions.empty() && processed < kMaxActionsPerTick)
+    {
+        AegisPendingAction pending = std::move(_pendingActions.front());
+        _pendingActions.pop_front();
+        ++processed;
+
+        if (std::find(handledGuids.begin(), handledGuids.end(), pending.guidLow) != handledGuids.end())
+            continue;
+
+        Player* player = ObjectAccessor::FindPlayerByLowGUID(pending.guidLow);
+        if (!player || !player->IsInWorld())
+            continue;
+
+        auto it = _players.find(pending.guidLow);
+        if (it == _players.end() || !it->second.online)
+            continue;
+
+        ExecuteAction(player, it->second, pending.evidence, pending.decision);
+        handledGuids.push_back(pending.guidLow);
+    }
 }
 
 void AcAegisMgr::ReloadConfig()
@@ -3646,7 +3939,7 @@ bool AcAegisMgr::GetPlayerDebugSnapshot(uint32 guidLow, AegisPlayerDebugSnapshot
     return found;
 }
 
-void AcAegisMgr::ClearPlayerOffense(Player* player)
+void AcAegisMgr::ClearPlayerOffense(Player* player, bool allowCoreBanClear)
 {
     if (!player)
         return;
@@ -3667,6 +3960,8 @@ void AcAegisMgr::ClearPlayerOffense(Player* player)
     ClearDebuffs(player);
     if (wasJailed)
     {
+        // The in-memory jail state is cleared above, so this release teleport is no
+        // longer intercepted by our own OnBeforeTeleport jail check.
         SetHomebind(player, sAcAegisConfig->Get().releaseMapId, sAcAegisConfig->Get().releaseX,
             sAcAegisConfig->Get().releaseY, sAcAegisConfig->Get().releaseZ);
         if (!IsNearPosition(player, sAcAegisConfig->Get().releaseMapId, sAcAegisConfig->Get().releaseX,
@@ -3679,22 +3974,29 @@ void AcAegisMgr::ClearPlayerOffense(Player* player)
     }
 
     if (hadBanState)
-        ClearCoreBanState(guidLow, player->GetSession() ? player->GetSession()->GetAccountId() : 0, previousPunish.lastBanMode, player);
+    {
+        if (allowCoreBanClear)
+            ClearCoreBanState(guidLow, player->GetSession() ? player->GetSession()->GetAccountId() : 0, previousPunish.lastBanMode, player);
+        else
+            WriteAuditLog("core_ban_kept", player, &ctx, "\"reason\":\"insufficient-security\"");
+    }
 
     _persistence.DeleteOffense(guidLow);
     WriteAuditLog("gm_clear", player, &ctx, "\"reason\":\"manual-clear\"");
 }
 
-void AcAegisMgr::ClearPlayerOffense(uint32 guidLow)
+void AcAegisMgr::ClearPlayerOffense(uint32 guidLow, bool allowCoreBanClear)
 {
     if (Player* player = ObjectAccessor::FindPlayerByLowGUID(guidLow))
     {
-        ClearPlayerOffense(player);
+        ClearPlayerOffense(player, allowCoreBanClear);
         return;
     }
 
     AegisOffenseRecord record;
-    if (_persistence.LoadOffenseByGuid(guidLow, record) && (record.permanentBan || record.banUntilEpoch > 0))
+    if (allowCoreBanClear &&
+        _persistence.LoadOffenseByGuid(guidLow, record) &&
+        (record.permanentBan || record.banUntilEpoch > 0))
         ClearCoreBanState(guidLow, record.accountId, record.lastBanMode, nullptr);
 
     _players.erase(guidLow);
@@ -3704,7 +4006,7 @@ void AcAegisMgr::ClearPlayerOffense(uint32 guidLow)
 void AcAegisMgr::DeletePlayerData(uint32 guidLow)
 {
     if (Player* player = ObjectAccessor::FindPlayerByLowGUID(guidLow))
-        ClearPlayerOffense(player);
+        ClearPlayerOffense(player, true);
     else
     {
         AegisOffenseRecord record;
@@ -3721,21 +4023,46 @@ void AcAegisMgr::PurgeAllData()
     AegisConfig const& cfg = sAcAegisConfig->Get();
     int64 nowEpoch = static_cast<int64>(std::time(nullptr));
 
-    for (auto& entry : _players)
+    // Collect first: everything below may call player code that re-enters the module
+    // (TeleportTo triggers our own OnBeforeTeleport), so the context map must not be
+    // iterated while those calls run.
+    std::vector<uint32> jailedPlayers;
+    for (auto const& entry : _players)
+    {
+        if (entry.second.online && entry.second.punish.jailUntilEpoch > nowEpoch)
+            jailedPlayers.push_back(entry.first);
+    }
+
+    for (uint32 guidLow : jailedPlayers)
+    {
+        Player* player = ObjectAccessor::FindPlayerByLowGUID(guidLow);
+        if (!player)
+            continue;
+
+        // Clear the in-memory jail state before teleporting, otherwise our own
+        // OnBeforeTeleport jail check rejects the release teleport and the player is
+        // left inside the cell.
+        auto it = _players.find(guidLow);
+        if (it != _players.end())
+        {
+            it->second.punish.jailUntilEpoch = 0;
+            it->second.punish.debuffUntilEpoch = 0;
+            it->second.punish.punishStage = AegisPunishStage::Observe;
+        }
+
+        ClearDebuffs(player);
+        SetHomebind(player, cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ);
+        if (!IsNearPosition(player, cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ, 5.0f))
+            player->TeleportTo(cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ, cfg.releaseO);
+    }
+
+    for (auto const& entry : _players)
     {
         if (!entry.second.online)
             continue;
 
         if (Player* player = ObjectAccessor::FindPlayerByLowGUID(entry.first))
-        {
             ClearDebuffs(player);
-            if (entry.second.punish.jailUntilEpoch > nowEpoch)
-            {
-                SetHomebind(player, cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ);
-                if (!IsNearPosition(player, cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ, 5.0f))
-                    player->TeleportTo(cfg.releaseMapId, cfg.releaseX, cfg.releaseY, cfg.releaseZ, cfg.releaseO);
-            }
-        }
     }
 
     for (AegisOffenseRecord const& record : _persistence.LoadAllOffenses())
@@ -3753,6 +4080,9 @@ void AcAegisMgr::OnLogin(Player* player)
     if (!player)
         return;
 
+    // Deliberately not gated on AcAegis.Enabled: the switch stops *new* detection,
+    // while a punishment that is already in its cycle (debuff / jail / temporary ban)
+    // keeps running until it expires, including across a relog.
     Touch(player);
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.online = true;
@@ -3856,6 +4186,8 @@ void AcAegisMgr::OnLogout(Player* player)
     if (!player)
         return;
 
+    // Not gated on AcAegis.Enabled either: an active punishment must survive a logout
+    // so that MaintainOfflinePunishments can still expire the core ban.
     AegisPlayerContext& ctx = GetOrCreate(player);
     ctx.online = false;
     ctx.lastSeenMs = _elapsedMs;
@@ -4003,6 +4335,11 @@ void AcAegisMgr::EmitSummary() const
 void AcAegisMgr::OnWorldUpdate(uint32 diff)
 {
     _elapsedMs += diff;
+
+    // AcAegis.Enabled only gates new detection. Punishments that are already in their
+    // cycle (debuff / jail / temporary ban) keep running until they expire, which is
+    // why this update path is not gated on the switch either.
+    ProcessPendingActions();
     MaintainPlayerPunishments();
 
     _offlinePunishSweepElapsedMs += diff;
@@ -4028,6 +4365,16 @@ void AcAegisMgr::OnWorldUpdate(uint32 diff)
     }
 }
 
+void AcAegisMgr::OnShutdown()
+{
+    // Runs from WORLDHOOK_ON_SHUTDOWN, i.e. before CharacterDatabase::Close(). Drains
+    // the queued event rows and joins the writer thread so nothing touches the
+    // database after it has been closed.
+    _pendingActions.clear();
+    _persistence.Shutdown();
+    ShutdownAsyncFileAppender();
+}
+
 void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
 {
     if (!player || !spell)
@@ -4042,9 +4389,6 @@ void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
         return;
 
     if (ContainsId(sAcAegisConfig->Get().spellWhitelist, spellInfo->Id))
-        ctx.lastSpellGraceMs = _elapsedMs;
-
-    if (HasExternalMobilityAura(player))
         ctx.lastSpellGraceMs = _elapsedMs;
 
     if (HasControlledTeleportEffect(spellInfo))
@@ -4112,6 +4456,8 @@ bool AcAegisMgr::OnBeforeTeleport(Player* player, uint32 mapId, float x, float y
     if (!player)
         return true;
 
+    // Not gated on AcAegis.Enabled: blocking the escape teleport of a player who is
+    // still inside an active jail sentence is part of finishing that punishment.
     AegisPlayerContext& ctx = GetOrCreate(player);
     int64 nowEpoch = static_cast<int64>(std::time(nullptr));
     AegisConfig const& cfg = sAcAegisConfig->Get();
@@ -4205,7 +4551,21 @@ void AcAegisMgr::OnUnderAckMount(Player* player)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
-    ctx.lastAckMountMs = _elapsedMs;
+
+    // The passive anticheat hook is shared by two very different events:
+    //  * mount / mount-speed aura changes (Unit::Mount, HandleAuraModIncreaseMountedSpeed)
+    //  * server issued displacement: charge, jump, knockback, pull and spell teleport
+    //    (Spell::EffectKnockBack, EffectPullTowards, EffectTeleportUnits, ...)
+    // Split them so the detected grace matches what actually happened, and so the
+    // displacement grace comes from the server rather than from a client packet.
+    bool looksLikeMount = player->IsMounted() ||
+        player->HasIncreaseMountedSpeedAura() ||
+        player->HasIncreaseMountedFlightSpeedAura();
+
+    if (looksLikeMount)
+        ctx.lastMountAckMs = _elapsedMs;
+    else
+        ctx.lastServerForceMoveMs = _elapsedMs;
 
     if (player->IsMounted() || player->HasIncreaseMountedSpeedAura() ||
         player->HasIncreaseMountedFlightSpeedAura() ||
@@ -4304,91 +4664,110 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
             ResetGatherWindow(player, ctx, "movement-reset");
     }
 
-    if (ctx.samples.Size() < 2)
-        return;
+    bool suspicious = false;
+    if (ctx.samples.Size() >= 2)
+    {
+        DecayRisk(ctx, _elapsedMs);
+        AegisMovementContext movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
+        suspicious = RunMovementDetectors(player, ctx, movementCtx);
+    }
 
-    DecayRisk(ctx, _elapsedMs);
+    // Record the rollback target only after the detectors inspected this sample, and
+    // only when the sample was clean. Doing it inside CaptureSample() meant the "safe"
+    // position was refreshed to the offending position before Rollback() ran, so a
+    // detected teleport rolled the player back onto itself (a no-op). It also keeps a
+    // sustained speed hack from dragging the target forward packet by packet.
+    if (!suspicious)
+        MaybeUpdateSafePosition(player, ctx, ctx.samples.Newest());
+}
 
-    AegisMovementContext movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
-
+bool AcAegisMgr::RunMovementDetectors(Player* player, AegisPlayerContext& ctx,
+    AegisMovementContext const& movementCtx)
+{
     if (std::optional<AegisEvidenceEvent> evidence = DetectForceMove(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectControlledMove(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectTransportRelativeSpeed(player, ctx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
-    AegisMoveSample const& cur = ctx.samples.Newest();
-    if (cfg.forceMoveEnabled && cur.opcode == CMSG_MOVE_KNOCK_BACK_ACK &&
-        (cur.jumpXySpeed >= cfg.forceMoveMinAckSpeedXY || std::fabs(cur.jumpZSpeed) >= cfg.forceMoveMinAckSpeedZ))
-    {
-        ctx.lastKnockBackAckMs = _elapsedMs;
-        movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
-    }
-
+    // Note: no grace is granted here from the client supplied knockback ACK. The
+    // server issued displacement grace comes from OnUnderAckMount, which the core
+    // triggers for knockback / pull / charge / jump / spell teleport effects.
     if (ShouldSkipAllMovementDetectors(movementCtx))
-        return;
+        return false;
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectTeleport(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectNoClip(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectWaterWalk(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectMount(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectFly(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectClimb(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectTime(player, ctx))
     {
         HandleEvidence(player, ctx, *evidence);
-        return;
+        return true;
     }
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectSpeed(player, ctx, movementCtx))
+    {
         HandleEvidence(player, ctx, *evidence);
+        return true;
+    }
+
+    return false;
 }
 
 bool AcAegisMgr::CheckMovement(Player* player, MovementInfo const& movementInfo, Unit* mover, bool /*jump*/)
 {
     if (!player || !mover || player != mover || !IsEnabledFor(player))
+        return true;
+
+    // This hook runs for every single movement packet. Only immobilised players can
+    // produce root break evidence, so everyone else leaves here without building a
+    // movement context (which walks the applied aura list several times).
+    if (!IsServerImmobilized(player))
         return true;
 
     Touch(player);
@@ -4432,7 +4811,8 @@ bool AcAegisMgr::HandleDoubleJump(Player* player, Unit* mover)
     }
 
     float groundZ = 0.0f;
-    if (!_geometry.GetGroundHeight(player, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), groundZ))
+    if (!GetGroundHeightCached(player, ctx, player->GetPositionX(),
+            player->GetPositionY(), player->GetPositionZ(), groundZ))
     {
         resetDoubleJumpWindow();
         ctx.lastJumpOpcodeMs = nowMs;

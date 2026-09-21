@@ -83,6 +83,8 @@ void AcAegisConfig::Reload()
     _config.samplingBufferSize = sConfigMgr->GetOption<uint32>("AcAegis.Sampling.BufferSize", 32);
     _config.riskHalfLifeSeconds = sConfigMgr->GetOption<float>("AcAegis.Risk.HalfLifeSeconds", 75.0f);
     _config.riskMaxDeltaPerMove = sConfigMgr->GetOption<float>("AcAegis.Risk.MaxDeltaPerMove", 30.0f);
+    _config.groundCacheTtlMs = sConfigMgr->GetOption<uint32>("AcAegis.Sampling.GroundCacheTtlMs", 250);
+    _config.groundCacheRadius = sConfigMgr->GetOption<float>("AcAegis.Sampling.GroundCacheRadius", 1.5f);
 
     _config.teleportGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportGraceMs", 2000);
     _config.teleportArrivalWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportArrivalWindowMs", 15000);
@@ -201,7 +203,6 @@ void AcAegisConfig::Reload()
     _config.useVmaps = sConfigMgr->GetOption<bool>("AcAegis.Geometry.UseVmaps", true);
     _config.useMmaps = sConfigMgr->GetOption<bool>("AcAegis.Geometry.UseMmaps", true);
     _config.allowHotPathReachability = sConfigMgr->GetOption<bool>("AcAegis.Geometry.AllowHotPathReachability", false);
-    _config.longPathTriggerDistance = sConfigMgr->GetOption<float>("AcAegis.Geometry.LongPathTriggerDistance", 40.0f);
 
     _config.notifyThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.NotifyThreshold", 60.0f);
     _config.rollbackThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.RollbackThreshold", 110.0f);
@@ -209,6 +210,7 @@ void AcAegisConfig::Reload()
     _config.jailThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.JailThreshold", 210.0f);
     _config.kickThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.KickThreshold", 260.0f);
     _config.banThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.BanThreshold", 320.0f);
+    _config.offenseTierRiskFloor = sConfigMgr->GetOption<bool>("AcAegis.Risk.OffenseTierFloor", true);
 
     _config.rollbackEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Rollback.Enabled", true);
     _config.debuffEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Debuff.Enabled", true);
@@ -241,6 +243,8 @@ void AcAegisConfig::Reload()
     _config.kickEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Kick.Enabled", true);
     _config.banEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Ban.Enabled", true);
     _config.punishBroadcastEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Broadcast.Enabled", true);
+    _config.punishBroadcastFormat = sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Broadcast.Format",
+        "玩家 |cffff0000{player}|r 因 |cffff0000{type}作弊|r，被 |cffff0000{action}|r，请各位英雄引以为戒，规范游戏。");
     _config.banMode = SanitizeLower(sConfigMgr->GetOption<std::string>("AcAegis.AutoAction.Ban.Mode", "account-by-character"));
     _config.banStrongEvidenceRequired = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Ban.StrongEvidenceRequired", true);
     _config.banMinOffenseCount = sConfigMgr->GetOption<uint32>("AcAegis.AutoAction.Ban.MinOffenseCount", 2);
@@ -270,6 +274,8 @@ void AcAegisConfig::Reload()
     _config.eventQueueLimit = std::max<uint32>(_config.eventBatchSize, _config.eventQueueLimit);
     _config.riskHalfLifeSeconds = std::max(1.0f, _config.riskHalfLifeSeconds);
     _config.riskMaxDeltaPerMove = std::max(1.0f, _config.riskMaxDeltaPerMove);
+    _config.groundCacheTtlMs = std::min<uint32>(_config.groundCacheTtlMs, 5000);
+    _config.groundCacheRadius = std::clamp(_config.groundCacheRadius, 0.0f, 10.0f);
 
     _config.speedTolerancePct = std::max(0.0f, _config.speedTolerancePct);
     _config.speedFlatMargin = std::max(0.0f, _config.speedFlatMargin);
@@ -363,8 +369,6 @@ void AcAegisConfig::Reload()
     _config.afkMinSuspiciousWindows = std::max<uint32>(1, _config.afkMinSuspiciousWindows);
     _config.afkEvidenceCooldownMs = std::max<uint32>(1000, _config.afkEvidenceCooldownMs);
     _config.afkIgnoreActionGraceMs = std::max<uint32>(0, _config.afkIgnoreActionGraceMs);
-
-    _config.longPathTriggerDistance = std::max(1.0f, _config.longPathTriggerDistance);
 
     _config.notifyThreshold = std::max(0.0f, _config.notifyThreshold);
     _config.rollbackThreshold = std::max(_config.notifyThreshold, _config.rollbackThreshold);

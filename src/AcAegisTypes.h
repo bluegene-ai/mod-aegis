@@ -148,6 +148,7 @@ struct AegisSafePosition
 {
     bool valid = false;
     uint32 mapId = 0;
+    uint32 serverMs = 0;
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -215,12 +216,17 @@ struct AegisPlayerContext
     uint32 lastTaxiFlightMs = 0;
     uint32 lastFallMs = 0;
     uint32 lastCanFlyServerMs = 0;
-    uint32 lastAckMountMs = 0;
+
+    // Server-issued displacement sources. The passive anticheat hook is shared by
+    // mount ack, charge, jump, knockback, pull and teleport effects, so the two are
+    // separated by inspecting server state at hook time (see OnUnderAckMount).
+    uint32 lastMountAckMs = 0;
+    uint32 lastServerForceMoveMs = 0;
+
     uint32 lastControlledTeleportMs = 0;
     uint32 lastControlledChargeMs = 0;
     uint32 lastControlledJumpMs = 0;
     uint32 lastControlledPullMs = 0;
-    uint32 lastKnockBackAckMs = 0;
     uint32 lastRootAckMs = 0;
     uint32 lastJumpOpcodeMs = 0;
     uint32 lastGeometryCheckMs = 0;
@@ -273,6 +279,17 @@ struct AegisPlayerContext
 
     AegisGatherState gather;
     AegisPunishState punish;
+
+    // Short-lived ground reference cache. Map::GetFullTerrainStatusForPosition is
+    // VMAP-heavy (see Map.cpp), so every ground lookup for the same spot inside the
+    // cache window reuses the previous result instead of redoing the collision query.
+    bool groundCacheValid = false;
+    uint32 groundCacheMs = 0;
+    uint32 groundCacheMapId = 0;
+    float groundCacheX = 0.0f;
+    float groundCacheY = 0.0f;
+    float groundCacheZ = 0.0f;
+    float groundCacheGroundZ = 0.0f;
 };
 
 struct AegisEvidenceEvent
@@ -323,6 +340,17 @@ struct AegisPlayerDebugSnapshot
     std::string lastBanMode;
     std::string lastBanResult;
     std::string lastBanReason;
+};
+
+// A punishment that was decided during detection and executes on the next world
+// update, so that no teleport / debuff / kick happens inside a loot, gathering or
+// movement callback.
+struct AegisPendingAction
+{
+    uint32 guidLow = 0;
+    uint32 queuedMs = 0;
+    AegisEvidenceEvent evidence;
+    AegisActionDecision decision;
 };
 
 #endif

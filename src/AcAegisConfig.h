@@ -36,6 +36,11 @@ struct AegisConfig
     uint32 samplingBufferSize = 32;
     float riskHalfLifeSeconds = 75.0f;
     float riskMaxDeltaPerMove = 30.0f;
+    // Ground reference cache: a Map::GetFullTerrainStatusForPosition query is
+    // VMAP-heavy, so lookups that stay inside this radius and time window reuse
+    // the previous result. Set GroundCacheTtlMs to 0 to disable caching.
+    uint32 groundCacheTtlMs = 250;
+    float groundCacheRadius = 1.5f;
 
     uint32 teleportGraceMs = 2000;
     uint32 teleportArrivalWindowMs = 15000;
@@ -154,7 +159,6 @@ struct AegisConfig
     bool useVmaps = true;
     bool useMmaps = true;
     bool allowHotPathReachability = false;
-    float longPathTriggerDistance = 40.0f;
 
     float notifyThreshold = 60.0f;
     float rollbackThreshold = 110.0f;
@@ -162,6 +166,10 @@ struct AegisConfig
     float jailThreshold = 210.0f;
     float kickThreshold = 260.0f;
     float banThreshold = 320.0f;
+    // Persistent offense history raises the punishment floor for the current
+    // evidence. Without this the risk gate below cancels every prior-tier
+    // promotion, and intermittent cheaters are never escalated.
+    bool offenseTierRiskFloor = true;
 
     bool rollbackEnabled = true;
     bool debuffEnabled = true;
@@ -194,6 +202,8 @@ struct AegisConfig
     bool kickEnabled = true;
     bool banEnabled = true;
     bool punishBroadcastEnabled = true;
+    std::string punishBroadcastFormat =
+        "玩家 |cffff0000{player}|r 因 |cffff0000{type}作弊|r，被 |cffff0000{action}|r，请各位英雄引以为戒，规范游戏。";
     std::string banMode = "account-by-character";
     bool banStrongEvidenceRequired = true;
     uint32 banMinOffenseCount = 2;

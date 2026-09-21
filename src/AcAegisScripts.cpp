@@ -234,12 +234,27 @@ public:
         if (!player)
             return false;
 
-        if (Player* target = player->GetConnectedPlayer())
-            sAcAegisMgr->ClearPlayerOffense(target);
-        else
-            sAcAegisMgr->ClearPlayerOffense(player->GetGUID().GetCounter());
+        // Lifting the core (BanMgr) ban is an administrator action. A gamemaster may
+        // still clear the accumulated offense, the debuff and the jail sentence, but
+        // the ban itself stays in place. A null session is the server console, which
+        // already runs with full privileges.
+        bool allowCoreBanClear = !handler->GetSession() ||
+            handler->GetSession()->GetSecurity() >= SEC_ADMINISTRATOR;
 
-        handler->PSendSysMessage("AcAegis 已清空玩家 {} 的 offense 与在线检测状态，保留 event 历史。", player->GetName());
+        if (Player* target = player->GetConnectedPlayer())
+            sAcAegisMgr->ClearPlayerOffense(target, allowCoreBanClear);
+        else
+            sAcAegisMgr->ClearPlayerOffense(player->GetGUID().GetCounter(), allowCoreBanClear);
+
+        if (allowCoreBanClear)
+            handler->PSendSysMessage(
+                "AcAegis 已清空玩家 {} 的 offense 与在线检测状态，并解除 Aegis 记录的核心封禁；保留 event 历史。",
+                player->GetName());
+        else
+            handler->PSendSysMessage(
+                "AcAegis 已清空玩家 {} 的 offense 与在线检测状态；核心封禁需要管理员权限才能解除。",
+                player->GetName());
+
         return true;
     }
 
@@ -409,7 +424,7 @@ public:
 class AcAegisWorldScript : public WorldScript
 {
 public:
-    AcAegisWorldScript() : WorldScript("AcAegisWorldScript", { WORLDHOOK_ON_UPDATE, WORLDHOOK_ON_AFTER_CONFIG_LOAD })
+    AcAegisWorldScript() : WorldScript("AcAegisWorldScript", { WORLDHOOK_ON_UPDATE, WORLDHOOK_ON_AFTER_CONFIG_LOAD, WORLDHOOK_ON_SHUTDOWN })
     {
     }
 
@@ -424,7 +439,14 @@ public:
         if (sAcAegisConfig->Get().enabled)
             LOG_INFO("module", "ACA: mod-ac-aegis enabled.");
         else
-            LOG_INFO("module", "ACA: mod-ac-aegis disabled.");
+            LOG_INFO("module", "ACA: mod-ac-aegis disabled (no new detection; active punishments still expire).");
+    }
+
+    void OnShutdown() override
+    {
+        // Runs before CharacterDatabase::Close(), so the queued event rows and the
+        // buffered log lines are flushed while the database is still open.
+        sAcAegisMgr->OnShutdown();
     }
 };
 

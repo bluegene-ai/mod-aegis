@@ -57,6 +57,11 @@ public:
     void DeleteOffense(uint32 guidLow) const;
     void DeletePlayerData(uint32 guidLow) const;
     void PurgeAllData() const;
+
+    // Stops the background event writer and drains every queued row into the
+    // asynchronous character database queue. Must be called from the world
+    // shutdown hook, before CharacterDatabase is closed.
+    void Shutdown() const;
 };
 
 #endif

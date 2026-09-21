@@ -23,8 +23,15 @@
 # Global / 全局开关
 ###################################################################################################
 
-# 是否启用 mod-ac-aegis。
-# 1 = 启用，0 = 禁用。
+# 是否启用新作弊行为检测。
+# 1 = 启用，0 = 关闭检测。
+#
+# 重要：设为 0 只会停止“抓取新的作弊行为”，已经在处罚周期内的玩家不会被释放：
+#   - 仍在 debuff / 监禁有效期内的玩家，登录时会被恢复处罚，监禁逃跑会被拉回；
+#   - 临时封禁到期后仍会被回收；
+#   - 每 tick 的处罚维护循环继续运行。
+# 也就是说，这个开关不能用来“立即停止所有处罚”。要立即释放全部在罚玩家，请用
+# .aegis purge，或直接清理 ac_aegis_offense 表。
 AcAegis.Enabled = 1
 
 # 是否对 GM 账号也启用检测。
@@ -123,12 +130,30 @@ AcAegis.Panel.AfkReason = 挂机
 # 数值越大，可用于判断的历史越长，但内存占用略高。
 AcAegis.Sampling.BufferSize = 32
 
+# 地面高度查询缓存有效期，单位毫秒。
+# 说明：Map::GetFullTerrainStatusForPosition 是 VMAP 重查询，核心自己都改成了惰性求值。
+# Aegis 在每个移动包上都要读地面高度，所以对同一位置做短期缓存。
+# 设为 0 表示关闭缓存（每个移动包都会做真实查询，CPU 开销显著上升）。
+AcAegis.Sampling.GroundCacheTtlMs = 250
+
+# 地面高度查询缓存可复用的水平半径，单位码。
+# 只有在缓存有效期内且查询点落在这个半径内时才会复用旧结果。
+AcAegis.Sampling.GroundCacheRadius = 1.5
+
 # 风险分数半衰期，单位秒。
 # 越大表示风险衰减越慢，历史可疑行为影响持续越久。
 AcAegis.Risk.HalfLifeSeconds = 75
 
-# 单次移动事件允许增加的最大风险值上限。
+# 单条证据允许增加的最大风险值上限（注意：是“每条证据”，不是“每次移动”）。
 # 用于防止某个异常事件把风险一次性拉满。
+#
+# 调参提醒：处罚档位由风险闸门（见下面 Risk.*Threshold）决定，而每条证据最多只能贡献
+# 这么多风险，并按 HalfLifeSeconds 衰减。因此闸门实质上是一个“事件频率门槛”：
+#   稳态风险 ≈ MaxDeltaPerMove / (1 - 0.5^(事件间隔 / HalfLifeSeconds))
+# 以默认值 30 / 75s 计算：
+#   间隔 > 75s  → 连 NotifyThreshold(60) 都到不了；
+#   间隔 > 24s  → 永远到不了 DebuffThreshold(150)。
+# 间歇性作弊依靠 Risk.OffenseTierFloor 兜底（见该开关说明）。
 AcAegis.Risk.MaxDeltaPerMove = 30
 
 ###################################################################################################
@@ -538,9 +563,6 @@ AcAegis.Geometry.UseMmaps = 1
 # 1 会更严格，但 CPU 开销也更高。
 AcAegis.Geometry.AllowHotPathReachability = 0
 
-# 当位移超过该距离时，更倾向走长路径/可达性逻辑，单位码。
-AcAegis.Geometry.LongPathTriggerDistance = 40.0
-
 ###################################################################################################
 # Risk Thresholds / 风险阈值
 ###################################################################################################
@@ -562,6 +584,15 @@ AcAegis.Risk.KickThreshold = 260
 
 # 达到该风险后允许封禁。
 AcAegis.Risk.BanThreshold = 320
+
+# 是否让持久化处罚历史抬高本次处罚下限。
+# 背景：上面的风险阈值实质上是一道“事件频率门槛”（见 MaxDeltaPerMove 说明）。如果
+# 玩家每次作弊间隔较长，风险值永远到不了 DebuffThreshold，处罚阶梯就永远不会推进，
+# 持久化的 offense 记录形同虚设。
+# 开启后：当本次证据等级 >= Medium 且该玩家已有 offense 历史时，处罚下限至少取
+# “历史 tier 对应的阶段”。证据等级低于 Medium 时不会用历史抬升，避免单条噪声把
+# 老账号直接打成重罚。封禁仍然需要满足 StrongEvidenceRequired 与 MinOffenseCount。
+AcAegis.Risk.OffenseTierFloor = 1
 
 ###################################################################################################
 # Auto Actions / 自动动作
@@ -642,6 +673,14 @@ AcAegis.AutoAction.Ban.Enabled = 1
 # 是否在处罚落地后发全服广播。
 # 默认开启；如果你希望收敛曝光面，可设为 0。
 AcAegis.AutoAction.Broadcast.Enabled = 1
+
+# 全服广播文案模板。
+# 可用占位符：
+#   {player} = 玩家名
+#   {type}   = 作弊类型（可含 [tag]，例如 瞬移[CoordinateTeleport]）
+#   {action} = 处罚动作（回滚 / 减益处罚 / 监禁 / 踢下线 / 账号封禁 ...）
+# 支持 |cffXXXXXX 颜色代码。留空则不广播。
+AcAegis.AutoAction.Broadcast.Format = 玩家 |cffff0000{player}|r 因 |cffff0000{type}作弊|r，被 |cffff0000{action}|r，请各位英雄引以为戒，规范游戏。
 
 # 封禁模式。
 # character = 封角色

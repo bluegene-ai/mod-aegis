@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS ac_aegis_offense (
     PRIMARY KEY (guid),
     KEY idx_ac_aegis_offense_account (account_id),
     KEY idx_ac_aegis_offense_stage (punish_stage),
-    KEY idx_ac_aegis_offense_last_offense (last_offense_at)
+    KEY idx_ac_aegis_offense_last_offense (last_offense_at),
+    KEY idx_ac_aegis_offense_ban_until (permanent_ban, ban_until)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS ac_aegis_event (
