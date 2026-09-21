@@ -1,0 +1,7 @@
+# Module runtime artifacts: the server writes these next to the module during local
+# debugging, they are not sources and must not be committed.
+logs.log
+docs/aegis.log
+
+# Editor / tooling state for this module
+.codebase-memory/
