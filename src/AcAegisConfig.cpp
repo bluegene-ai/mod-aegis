@@ -84,7 +84,7 @@ void AcAegisConfig::Reload()
     _config.riskHalfLifeSeconds = sConfigMgr->GetOption<float>("AcAegis.Risk.HalfLifeSeconds", 75.0f);
     _config.riskMaxDeltaPerMove = sConfigMgr->GetOption<float>("AcAegis.Risk.MaxDeltaPerMove", 30.0f);
     _config.groundCacheTtlMs = sConfigMgr->GetOption<uint32>("AcAegis.Sampling.GroundCacheTtlMs", 250);
-    _config.groundCacheRadius = sConfigMgr->GetOption<float>("AcAegis.Sampling.GroundCacheRadius", 1.5f);
+    _config.groundCacheRadius = sConfigMgr->GetOption<float>("AcAegis.Sampling.GroundCacheRadius", 4.0f);
 
     _config.teleportGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportGraceMs", 2000);
     _config.teleportArrivalWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Accuracy.TeleportArrivalWindowMs", 15000);
@@ -211,6 +211,7 @@ void AcAegisConfig::Reload()
     _config.kickThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.KickThreshold", 260.0f);
     _config.banThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.BanThreshold", 320.0f);
     _config.offenseTierRiskFloor = sConfigMgr->GetOption<bool>("AcAegis.Risk.OffenseTierFloor", true);
+    _config.strongEvidenceFloor = sConfigMgr->GetOption<bool>("AcAegis.Risk.StrongEvidenceFloor", true);
 
     _config.rollbackEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Rollback.Enabled", true);
     _config.debuffEnabled = sConfigMgr->GetOption<bool>("AcAegis.AutoAction.Debuff.Enabled", true);

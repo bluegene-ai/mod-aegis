@@ -233,6 +233,10 @@ struct AegisPlayerContext
     uint32 lastJailReturnCheckMs = 0;
     uint32 lastPunishNotifyMs = 0;
     bool serverCanFly = false;
+    // Mounted / mounted-speed boundary, tracked so the shared
+    // AnticheatSetUnderACKmount hook can tell a real mount transition from a
+    // repeat notification. See AcAegisMgr::OnUnderAckMount.
+    bool observedMountedState = false;
     bool observedAuthorizedAerialState = false;
     bool observedTaxiFlightState = false;
     bool observedTransportState = false;

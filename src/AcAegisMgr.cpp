@@ -910,6 +910,7 @@ namespace
         ctx.lastJumpOpcodeMs = 0;
         ctx.lastJailReturnCheckMs = 0;
         ctx.lastPunishNotifyMs = 0;
+        ctx.observedMountedState = false;
         ctx.observedAuthorizedAerialState = false;
         ctx.observedTaxiFlightState = false;
         ctx.observedTransportState = false;
@@ -932,6 +933,7 @@ namespace
 
         bool hasAerialSkipState =
             IsServerAuthorizedAerialState(player) || player->IsMounted() ||
+            player->HasIncreaseMountedSpeedAura() ||
             player->HasIncreaseMountedFlightSpeedAura() ||
             player->HasHoverAura() || player->HasWaterWalkAura() ||
             player->HasGhostAura() ||
@@ -973,6 +975,9 @@ namespace
                 MOVEMENTFLAG_SWIMMING)) != 0)
             ctx.lastFallMs = nowMs;
 
+        ctx.observedMountedState = player->IsMounted() ||
+            player->HasIncreaseMountedSpeedAura() ||
+            player->HasIncreaseMountedFlightSpeedAura();
         ctx.observedAuthorizedAerialState = hasAerialSkipState;
         ctx.observedTaxiFlightState = hasTaxiFlight;
         ctx.observedTransportState = hasTransport;
@@ -3457,6 +3462,25 @@ AegisActionDecision AcAegisMgr::DetermineAction(Player* /*player*/, AegisPlayerC
 
     AegisPunishStage finalStage = ApplyRiskGate(stageByEvidence, stageByRisk);
 
+    // The two floors above still cannot help a first-time intermittent cheater: the
+    // offense floor needs a tier, and a tier only grows once a punishment has already
+    // been applied, which needs risk, which an event interval above ~24 seconds never
+    // produces. Strong evidence whose own family floor is already jail or higher
+    // (BasePunishStage) describes a physically impossible movement - a coordinate
+    // teleport, an unreachable micro path, a low gravity jump, a blocked wall climb -
+    // so it is treated as high risk on its own instead of being gated by event
+    // frequency. The behavioral AFK heuristic is deliberately excluded: it is not a
+    // physics claim and stays fully gated. Ban keeps its extra
+    // Ban.StrongEvidenceRequired and Ban.MinOffenseCount conditions below.
+    if (cfg.strongEvidenceFloor &&
+        IsPositionMovementCheat(evidence.cheatType) &&
+        StageRank(baseStage) >= StageRank(AegisPunishStage::Jail) &&
+        evidence.level == AegisEvidenceLevel::Strong)
+    {
+        finalStage = static_cast<AegisPunishStage>(std::max(
+            StageRank(finalStage), StageRank(baseStage)));
+    }
+
     uint32 pendingPunishOffenseCount =
         ctx.punish.offenseCount +
         (ShouldCountOffenseForPunishStage(finalStage, cfg) ? 1u : 0u);
@@ -4552,12 +4576,20 @@ void AcAegisMgr::OnUnderAckMount(Player* player)
 
     AegisPlayerContext& ctx = GetOrCreate(player);
 
-    // The passive anticheat hook is shared by two very different events:
-    //  * mount / mount-speed aura changes (Unit::Mount, HandleAuraModIncreaseMountedSpeed)
-    //  * server issued displacement: charge, jump, knockback, pull and spell teleport
-    //    (Spell::EffectKnockBack, EffectPullTowards, EffectTeleportUnits, ...)
-    // Split them so the detected grace matches what actually happened, and so the
-    // displacement grace comes from the server rather than from a client packet.
+    // The passive anticheat hook is shared by many unrelated events. The core calls
+    // it from 28 sites: Unit::Mount/Dismount, Enter/ExitVehicle, RemoveCharmedBy,
+    // HandleMoverRelocation (leaving a transport), HandleForceSpeedChangeAck, the
+    // spell displacement effects (charge, jump, knockback, pull, spell teleport) and
+    // - importantly - every speed aura amount change, because
+    // AuraEffect::HandleAuraModIncreaseSpeed and HandleAuraModIncreaseFlightSpeed
+    // both end with an unconditional call (SpellAuraEffects.cpp). Those handlers
+    // cover SPELL_AURA_MOD_INCREASE_SPEED, _MOUNTED_SPEED, _SPEED_ALWAYS,
+    // _MOUNTED_SPEED_ALWAYS, _SPEED_NOT_STACK, _MOUNTED_SPEED_NOT_STACK,
+    // _MINIMUM_SPEED and the six flight speed auras.
+    //
+    // Split mount from server-issued displacement so the grace matches what actually
+    // happened, and so the displacement grace comes from the server rather than from
+    // a client packet.
     bool looksLikeMount = player->IsMounted() ||
         player->HasIncreaseMountedSpeedAura() ||
         player->HasIncreaseMountedFlightSpeedAura();
@@ -4582,7 +4614,16 @@ void AcAegisMgr::OnUnderAckMount(Player* player)
     if (player->GetVehicle())
         ctx.lastVehicleMs = _elapsedMs;
 
-    ResetMovementDetectionState(ctx);
+    // Only reset the detection state when the mounted boundary actually moved, the
+    // same way SyncMovementBoundaryState() does it. Resetting on every call used to
+    // clear the sample chain and every hit window (speed, noclip, teleport burst,
+    // fly, climb, ...) on each speed-aura recalculation, which made all of the
+    // windowed detectors unreachable for any player carrying a speed aura.
+    if (looksLikeMount != ctx.observedMountedState)
+    {
+        ctx.observedMountedState = looksLikeMount;
+        ResetMovementDetectionState(ctx);
+    }
 }
 
 void AcAegisMgr::OnVehicleTransition(Player* player)

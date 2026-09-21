@@ -39,8 +39,16 @@ struct AegisConfig
     // Ground reference cache: a Map::GetFullTerrainStatusForPosition query is
     // VMAP-heavy, so lookups that stay inside this radius and time window reuse
     // the previous result. Set GroundCacheTtlMs to 0 to disable caching.
+    //
+    // The radius must exceed the distance a player covers inside the TTL or the
+    // cache never hits while moving: at MOVE_RUN 7 yd/s a 250 ms window moves
+    // 1.75 yards, so the old 1.5 yard default missed on essentially every packet
+    // and the hot path kept paying one full terrain query per movement packet.
+    // 4.0 yards also covers mounted ground speed (14 yd/s * 250 ms = 3.5 yards).
+    // Flight and transport movement skip the cache entirely (see
+    // MaybeUpdateSafePosition), so the larger radius cannot hide a fly hack.
     uint32 groundCacheTtlMs = 250;
-    float groundCacheRadius = 1.5f;
+    float groundCacheRadius = 4.0f;
 
     uint32 teleportGraceMs = 2000;
     uint32 teleportArrivalWindowMs = 15000;
@@ -170,6 +178,15 @@ struct AegisConfig
     // evidence. Without this the risk gate below cancels every prior-tier
     // promotion, and intermittent cheaters are never escalated.
     bool offenseTierRiskFloor = true;
+    // Strong evidence whose own family floor is already jail or above (coordinate
+    // teleport, stationary coordinate shift, unreachable micro path, low gravity
+    // jump, blocked wall climb) is treated as high risk on its own, so the risk gate
+    // cannot cancel it. Without this the gate is purely an event frequency threshold
+    // and an intermittent cheater below roughly one event per 24 seconds never
+    // reaches a punishment at all. Restricted to the movement/geometry families: the
+    // behavioural gather heuristic stays fully gated. Ban still additionally requires
+    // Ban.StrongEvidenceRequired and Ban.MinOffenseCount.
+    bool strongEvidenceFloor = true;
 
     bool rollbackEnabled = true;
     bool debuffEnabled = true;

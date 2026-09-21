@@ -138,7 +138,14 @@ AcAegis.Sampling.GroundCacheTtlMs = 250
 
 # 地面高度查询缓存可复用的水平半径，单位码。
 # 只有在缓存有效期内且查询点落在这个半径内时才会复用旧结果。
-AcAegis.Sampling.GroundCacheRadius = 1.5
+#
+# 重要：半径必须大于“有效期内玩家能移动的距离”，否则移动中永远不命中，缓存形同虚设。
+#   MOVE_RUN 7 码/秒 × 250ms = 1.75 码 → 旧默认值 1.5 会让跑动中的每个移动包都 miss，
+#   等于没缓存，热路径仍在每包做一次完整地形查询。
+#   坐骑地面速度 14 码/秒 × 250ms = 3.5 码 → 4.0 可覆盖。
+# 飞行 / 载具 / 传送带状态下不使用该缓存（见 MaybeUpdateSafePosition 的提前返回），
+# 所以放大半径不会掩盖飞行外挂。
+AcAegis.Sampling.GroundCacheRadius = 4.0
 
 # 风险分数半衰期，单位秒。
 # 越大表示风险衰减越慢，历史可疑行为影响持续越久。
@@ -593,6 +600,28 @@ AcAegis.Risk.BanThreshold = 320
 # “历史 tier 对应的阶段”。证据等级低于 Medium 时不会用历史抬升，避免单条噪声把
 # 老账号直接打成重罚。封禁仍然需要满足 StrongEvidenceRequired 与 MinOffenseCount。
 AcAegis.Risk.OffenseTierFloor = 1
+
+# 是否允许“强证据 + 高危类型”绕过风险频率闸门。
+#
+# 为什么需要它：OffenseTierFloor 解决不了“第一次被发现的间歇性作弊者”——它需要已有
+# tier，而 tier 只在已经处罚过之后才增长，处罚又需要风险，风险又需要事件频率。于是
+# 事件间隔 > 24s 的作弊者永远停在 Observe/Rollback，一次都罚不到。
+#
+# 开启后的行为：仅当同时满足以下三条时，本次处罚直接取“证据自身档位”（见
+# BasePunishStage），不再被当前风险值压制：
+#   1. 证据等级 == Strong；
+#   2. 该类型的固有档位 >= Jail；
+#   3. 类型属于位移/几何族（速度、传送、穿墙、飞行、爬墙、坐骑）。
+# 实际命中集合：CoordinateTeleport / StationaryCoordinateShift（传送）、
+# Strong NoClip（含 BlockedMicroPath）、LowGravityJump（飞行）、
+# Strong SuperJumpApex（爬墙）。
+#
+# 这些类型都要求“物理上不可能”的量化门槛（例如轴位移 >= 25 码、累积不可达微路径、
+# 爬升 >= 4 码）并经过多重命中确认，所以按高危处理是合理的。
+# 行为启发式的挂机检测（Afk）被明确排除，它仍然完全受风险闸门约束。
+# 封禁仍然额外需要 StrongEvidenceRequired 与 MinOffenseCount，因此首条强证据最高只能
+# 到 Kick（见 DetermineAction 中的封禁闸门）。
+AcAegis.Risk.StrongEvidenceFloor = 1
 
 ###################################################################################################
 # Auto Actions / 自动动作

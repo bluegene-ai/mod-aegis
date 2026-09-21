@@ -16,9 +16,22 @@
 namespace
 {
     // SQL literal escaping done locally on purpose: CharacterDatabase.EscapeString()
-    // reaches into the synchronous connection pool without locking, and the event
-    // writer runs on its own thread. Doubling single quotes stays correct even when
-    // the server runs with NO_BACKSLASH_ESCAPES.
+    // reaches into the synchronous connection pool without locking
+    // (DatabaseWorkerPool::EscapeString has no LockIfReady), and the caller may run
+    // off the world thread.
+    //
+    // Only single quotes are doubled. That is the one escape sequence whose meaning
+    // does not depend on sql_mode, so it is accepted both in the default mode and
+    // with NO_BACKSLASH_ESCAPES. Escaping backslashes here would be wrong under
+    // NO_BACKSLASH_ESCAPES (where '\\' stays two characters) and emitting C-style
+    // sequences like \n would be wrong there as well, so neither is done. NUL is
+    // replaced because MySQL treats a literal NUL byte as a string terminator.
+    //
+    // Every value that reaches this function is a fixed detector identifier, a
+    // geometry reason or a std::to_string() of a number (evidence tags and detail
+    // texts), so a literal backslash cannot occur. Anything new that can carry
+    // external text (a character name, a reason template) must either go through a
+    // prepared statement or be re-escaped for the active sql_mode.
     std::string EscapeForCharacterDb(std::string const& value)
     {
         std::string result;
@@ -26,27 +39,12 @@ namespace
 
         for (char ch : value)
         {
-            switch (ch)
-            {
-            case '\'':
+            if (ch == '\'')
                 result += "''";
-                break;
-            case '\\':
-                result += "\\\\";
-                break;
-            case '\n':
-                result += "\\n";
-                break;
-            case '\r':
-                result += "\\r";
-                break;
-            case '\x1a':
-                result += "\\Z";
-                break;
-            default:
+            else if (ch == '\0')
+                result += ' ';
+            else
                 result += ch;
-                break;
-            }
         }
 
         return result;

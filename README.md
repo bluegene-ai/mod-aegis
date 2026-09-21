@@ -149,18 +149,63 @@ To release every currently punished player immediately, use `.aegis purge`
 - Root-break detection uses the server immobilisation state (`UNIT_STATE_ROOT`,
   stun, root aura). `Player::IsRooted()` cannot be used because the core strips
   `MOVEMENTFLAG_ROOT` from every client movement packet.
-- Ground lookups are cached per player (`AcAegis.Sampling.GroundCacheTtlMs`,
-  `AcAegis.Sampling.GroundCacheRadius`) because
-  `Map::GetFullTerrainStatusForPosition` is a VMAP-heavy query; set the TTL to 0
-  to disable the cache.
 - `AcAegis.Risk.OffenseTierFloor` lets the persistent offense ladder raise the
   punishment floor for the current evidence. Without it the risk gate, which is
   in practice an event-rate gate, cancels every prior-tier promotion and
   intermittent cheaters are never escalated.
+- `AcAegis.Risk.StrongEvidenceFloor` closes the remaining hole in that ladder.
+  The offense floor needs an existing tier, and a tier only grows after a
+  punishment, which needs risk, which an event interval above roughly 24 seconds
+  never produces — so a first-time intermittent cheater could never be punished at
+  all. With this switch on, Strong evidence whose own family floor is already jail
+  or higher (coordinate teleport, stationary coordinate shift, unreachable micro
+  path, low gravity jump, blocked wall climb) is treated as high risk on its own
+  and is no longer cancelled by event frequency. It is restricted to the
+  movement/geometry families; the behavioral gather heuristic stays fully gated,
+  and bans still additionally require `Ban.StrongEvidenceRequired` and
+  `Ban.MinOffenseCount`, so a first Strong event can reach at most Kick.
+- The detection state is only reset when a real movement boundary changes.
+  `AcAegis` used to reset it unconditionally from the shared
+  `AnticheatSetUnderACKmount` hook, which the core calls from 28 sites including
+  every speed-aura amount recalculation
+  (`AuraEffect::HandleAuraModIncreaseSpeed` / `HandleAuraModIncreaseFlightSpeed`
+  cover `SPELL_AURA_MOD_INCREASE_SPEED`, `_MOUNTED_SPEED`, `_SPEED_ALWAYS`,
+  `_MOUNTED_SPEED_ALWAYS`, `_SPEED_NOT_STACK`, `_MOUNTED_SPEED_NOT_STACK`,
+  `_MINIMUM_SPEED` and the six flight speed auras). That cleared the sample chain
+  and every hit window on each recalculation, which made all of the windowed
+  detectors unreachable for anyone carrying a speed aura.
+- Ground lookups are cached per player (`AcAegis.Sampling.GroundCacheTtlMs`,
+  `AcAegis.Sampling.GroundCacheRadius`) because
+  `Map::GetFullTerrainStatusForPosition` is a VMAP-heavy query; set the TTL to 0
+  to disable the cache. **The radius must exceed the distance covered inside the
+  TTL or the cache never hits while moving**: at `MOVE_RUN` 7 yd/s a 250 ms window
+  moves 1.75 yards, so the previous 1.5 yard default missed on essentially every
+  packet and the hot path kept paying one full terrain query per movement packet.
+  Flight and transport movement do not use the cache at all.
 - Geometry uses the real collision hit position from
   `MapCollisionData::GetStaticTree()/GetDynamicTree()`, so
   `AcAegis.Detector.NoClip.MinRemainingDistance` measures the real distance from
   the hit point to the destination.
+
+## Known limits
+
+- Core and script code that moves a player with `Unit::NearTeleportTo` does not
+  run the `OnPlayerBeforeTeleport` hook (only `Player::TeleportTo` does), so Aegis
+  gets no teleport grace for it. This covers battleground spawn and fence resets,
+  vehicle relocations, transports, the Warlock demonic circle and a number of boss
+  mechanics. A displacement produced that way can be classified as a coordinate
+  teleport if it exceeds the axis or distance thresholds.
+- `AcAegis.AutoAction.Ban.Mode = character` only writes the `character_banned`
+  table, which does not by itself block login. Only `account` and the default
+  `account-by-character` write `account_banned`, which is what the auth server
+  checks. Keep the default unless you specifically want the weaker behaviour.
+- On maps where mounts are allowed, `DetectMount` can only observe, not punish:
+  the strong branch requires an instance template with `AllowMount = 0`.
+- `DetectTime` only covers a clear client clock lead (ratio >= 1.35 and a lead of
+  at least 180 ms); a mild time multiplier below that is not detected.
+- `ac_aegis_event` has no retention policy and grows without bound. Plan an
+  external cleanup such as
+  `DELETE FROM ac_aegis_event WHERE created_at < NOW() - INTERVAL 30 DAY`.
 
 ## GM command security
 
