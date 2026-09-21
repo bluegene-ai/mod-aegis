@@ -36,11 +36,20 @@ It depends on existing hook and engine capabilities:
 - PlayerScript passive anticheat hooks
 - teleport lifecycle hooks
 - loot and gathering-related player hooks
-- Map::GetHeight
-- Map::GetObjectHitPos
+- Map::GetHeight / Map::GetFullTerrainStatusForPosition
+- Map::isInLineOfSight
+- MapCollisionData::GetStaticTree()/GetDynamicTree() GetObjectHitPos (via
+  Map::GetMapCollisionData)
 - Map::CanReachPositionAndGetValidCoords
 - PathGenerator
 - BanMgr
+
+Note on the collision API: `Map` has no `GetObjectHitPos` member. The real hit
+position is resolved through the two collision trees reached from
+`Map::GetMapCollisionData()`, and the module takes whichever reported hit is
+closest to the ray origin. When neither tree reports a position the segment
+midpoint is used as a fallback and the evidence reason carries a `-approx`
+suffix, so an approximated hit is never mistaken for a measured one.
 
 ### Why This Is Better Than Copying an Existing Module
 
@@ -184,8 +193,9 @@ contradicting server state.
 
 The following AzerothCore capabilities are reused directly:
 
-- Map::GetHeight for ground reference
-- Map::GetObjectHitPos for dynamic object collision, including doors and WMOs
+- Map::GetHeight and Map::GetFullTerrainStatusForPosition for ground reference
+- MapCollisionData static and dynamic tree GetObjectHitPos for dynamic object
+  collision, including doors and WMOs
 - VMAP object hit tests for static collision
 - Map::CanReachPositionAndGetValidCoords for collision-aware and slope-aware
   reachability validation

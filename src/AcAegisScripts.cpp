@@ -304,7 +304,6 @@ public:
         PLAYERHOOK_ANTICHEAT_SET_CAN_FLY_BY_SERVER,
         PLAYERHOOK_ANTICHEAT_SET_UNDER_ACK_MOUNT,
         PLAYERHOOK_ANTICHEAT_SET_ROOT_ACK_UPD,
-        PLAYERHOOK_ANTICHEAT_SET_JUMPING_BY_OPCODE,
         PLAYERHOOK_ANTICHEAT_UPDATE_MOVEMENT_INFO,
         PLAYERHOOK_ANTICHEAT_HANDLE_DOUBLE_JUMP,
         PLAYERHOOK_ANTICHEAT_CHECK_MOVEMENT_INFO
@@ -365,11 +364,6 @@ public:
     void AnticheatSetRootACKUpd(Player* player) override
     {
         sAcAegisMgr->OnRootAckUpd(player);
-    }
-
-    void AnticheatSetJumpingbyOpcode(Player* player, bool jump) override
-    {
-        sAcAegisMgr->OnJumpOpcode(player, jump);
     }
 
     void AnticheatUpdateMovementInfo(Player* player, MovementInfo const& movementInfo) override

@@ -59,8 +59,7 @@ enum class AegisControlledMoveKind : uint8
     None = 0,
     Charge = 1,
     Jump = 2,
-    Pull = 3,
-    Teleport = 4
+    Teleport = 3
 };
 
 template <class T>

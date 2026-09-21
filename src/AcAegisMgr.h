@@ -87,7 +87,6 @@ public:
     void OnUnderAckMount(Player* player);
     void OnVehicleTransition(Player* player);
     void OnRootAckUpd(Player* player);
-    void OnJumpOpcode(Player* player, bool jump);
     void OnMovementInfoUpdate(Player* player, MovementInfo const& movementInfo);
     void OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 opcode);
 

@@ -465,9 +465,18 @@ namespace
             spellInfo->HasAura(SPELL_AURA_SAFE_FALL);
     }
 
+    // Short-circuit with the core's O(1) aura-type predicates before walking the
+    // applied aura list. HasAuraType() is a lookup in the per-unit aura type map
+    // (Unit::HasAuraType -> m_modAuras[type].empty()), while IsServerAuthorizedAerialAura
+    // re-derives the same effect-type test from SpellInfo for every applied aura. These
+    // run on every movement packet, so the walk must only happen once something matched.
     bool HasFallMitigationAura(Player* player)
     {
         if (!player)
+            return false;
+
+        if (!player->HasFeatherFallAura() &&
+            !player->HasAuraType(SPELL_AURA_SAFE_FALL))
             return false;
 
         for (auto const& [spellId, aurApp] : player->GetAppliedAuras())
@@ -481,9 +490,14 @@ namespace
         return false;
     }
 
+    // See HasFallMitigationAura: the O(1) type predicates gate the aura walk.
     bool IsServerAuthorizedAerialState(Player* player)
     {
         if (!player)
+            return false;
+
+        if (!player->HasFlyAura() && !player->HasHoverAura() &&
+            !player->HasIncreaseMountedFlightSpeedAura())
             return false;
 
         for (auto const& [spellId, aurApp] : player->GetAppliedAuras())
@@ -524,9 +538,14 @@ namespace
         return casterGuid != player->GetGUID();
     }
 
+    // See HasFallMitigationAura: the O(1) type predicates gate the aura walk.
     bool HasExternalMobilityAura(Player* player)
     {
         if (!player)
+            return false;
+
+        if (!player->HasFlyAura() && !player->HasHoverAura() &&
+            !player->HasIncreaseMountedFlightSpeedAura())
             return false;
 
         for (auto const& [spellId, aurApp] : player->GetAppliedAuras())
@@ -711,7 +730,13 @@ namespace
             spellInfo->HasEffect(SPELL_EFFECT_LEAP_BACK));
     }
 
-    bool HasControlledPullEffect(SpellInfo const* spellInfo)
+    // Pull and knockback effects move the target without arming an expectation
+    // window: the server never tells this hook how far the target was supposed to
+    // travel, so there is nothing to compare against. What they do get is the
+    // server-force grace below, so the displacement they cause is not read as a
+    // teleport. DetectForceMove covers the separate case of the client suppressing a
+    // knockback, which it detects from the CMSG_MOVE_KNOCK_BACK_ACK sample.
+    bool HasPullOrKnockbackEffect(SpellInfo const* spellInfo)
     {
         return spellInfo && (spellInfo->HasEffect(SPELL_EFFECT_PULL_TOWARDS) ||
             spellInfo->HasEffect(SPELL_EFFECT_PULL_TOWARDS_DEST) ||
@@ -727,8 +752,6 @@ namespace
             return "IgnoredCharge";
         case AegisControlledMoveKind::Jump:
             return "IgnoredJump";
-        case AegisControlledMoveKind::Pull:
-            return "IgnoredPull";
         case AegisControlledMoveKind::Teleport:
             return "IgnoredTeleport";
         default:
@@ -1089,6 +1112,50 @@ namespace
         ClearControlledMoveExpectation(ctx);
         ClearPendingTeleportExpectation(ctx);
         return true;
+    }
+
+    // MovementHandlerScript::OnPlayerMove fires from inside
+    // WorldSession::ProcessMovementInfo, so it sees every opcode that reaches one of
+    // the six ProcessMovementInfo callers - 47 of them - and not only real movement.
+    // Control-flow acknowledgements and state-change packets carry a client snapshot
+    // whose position and time fields are not a movement segment: a knockback ack
+    // reports the landing spot, MSG_MOVE_FALL_LAND reports where the fall ended and
+    // the various *_ACK packets only confirm a server flag change. Reading one as a
+    // travelled segment fabricates displacement out of a state transition, which the
+    // teleport and speed detectors then see as a coordinate jump.
+    //
+    // Such a packet is still captured as a sample (DetectForceMove needs the knockback
+    // ack) and still drives SyncMovementBoundaryState, but the segment detectors are
+    // not run on it. Returns true when the opcode must not be treated as movement.
+    bool IsNonMovementAckOpcode(uint32 opcode)
+    {
+        switch (opcode)
+        {
+        case CMSG_MOVE_KNOCK_BACK_ACK:
+        case CMSG_FORCE_MOVE_ROOT_ACK:
+        case CMSG_FORCE_MOVE_UNROOT_ACK:
+        case CMSG_MOVE_HOVER_ACK:
+        case CMSG_MOVE_FEATHER_FALL_ACK:
+        case CMSG_MOVE_WATER_WALK_ACK:
+        case CMSG_MOVE_SET_CAN_FLY_ACK:
+        case CMSG_MOVE_GRAVITY_DISABLE_ACK:
+        case CMSG_MOVE_GRAVITY_ENABLE_ACK:
+        case CMSG_MOVE_FALL_RESET:
+        case CMSG_MOVE_CHNG_TRANSPORT:
+        case CMSG_DISMISS_CONTROLLED_VEHICLE:
+        case CMSG_FORCE_RUN_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_RUN_BACK_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_SWIM_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_SWIM_BACK_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_WALK_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_TURN_RATE_CHANGE_ACK:
+        case CMSG_FORCE_FLIGHT_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK:
+        case CMSG_FORCE_PITCH_RATE_CHANGE_ACK:
+            return true;
+        default:
+            return false;
+        }
     }
 
     bool HasSharpDirectionChange2D(AegisMoveSample const& older,
@@ -4465,7 +4532,7 @@ void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
             std::max(0.75f, minDistance2D), minDeltaZ);
     }
 
-    if (HasControlledPullEffect(spellInfo))
+    if (HasPullOrKnockbackEffect(spellInfo))
     {
         ctx.lastControlledPullMs = _elapsedMs;
         ctx.lastSpellGraceMs = _elapsedMs;
@@ -4651,17 +4718,6 @@ void AcAegisMgr::OnRootAckUpd(Player* player)
     GetOrCreate(player).lastRootAckMs = _elapsedMs;
 }
 
-void AcAegisMgr::OnJumpOpcode(Player* player, bool jump)
-{
-    if (!player || !jump)
-        return;
-
-    if (!sAcAegisConfig->Get().enabled)
-        return;
-
-    GetOrCreate(player).lastJumpOpcodeMs = _elapsedMs;
-}
-
 void AcAegisMgr::OnMovementInfoUpdate(Player* player, MovementInfo const& movementInfo)
 {
     if (!player)
@@ -4694,6 +4750,73 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
 
     SyncMovementBoundaryState(player, movementInfo, ctx, _elapsedMs);
 
+    // Build the movement context once and reuse it: it walks the applied aura list
+    // several times, so it must not be built twice on the same packet.
+    AegisMovementContext movementCtx;
+
+    // Server-authoritative displacement check.
+    //
+    // Only Player::TeleportTo runs the OnPlayerBeforeTeleport hook, so the module gets
+    // no grace when the core or a script moves a player with Unit::NearTeleportTo.
+    // That covers battleground spawn and fence resets, vehicle relocation, transports,
+    // the Warlock demonic circle and a number of boss mechanics. Such a move changes
+    // player->GetPositionX/Y/Z without running the hook, so the next movement packet
+    // reports a large displacement that DetectTeleport reads as a coordinate teleport
+    // and then rolls the player back.
+    //
+    // The packet position and the server unit position normally agree to within one
+    // packet interval of movement plus latency: HandleMoverRelocation runs on
+    // essentially every accepted movement packet, knockback included. A gap beyond
+    // that can only come from an external relocation of the unit. When one is seen the
+    // sample chain is restarted and the segment detectors are skipped for this packet,
+    // so the packet that merely reports the forced landing is not mistaken for a
+    // client teleport. SyncMovementBoundaryState has already absorbed the new position
+    // as the observed boundary, so the next packet compares against it.
+    //
+    // This is not a blind spot for repeated cheating: a client-side teleport never
+    // moves player->GetPositionX/Y/Z, so the gap stays large on every such packet and
+    // the check keeps firing while the evidence stays suppressed. It trades a little
+    // teleport coverage for removing the harmful rollback.
+    bool serverRelocatedPlayer = false;
+    if (!IsNonMovementAckOpcode(opcode))
+    {
+        movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
+
+        if (!movementCtx.isBeingTeleported && !movementCtx.isTaxiFlight &&
+            !movementCtx.hasTransport && !movementCtx.hasVehicle)
+        {
+            float maxMoveTypeSpeed = 0.0f;
+            for (uint8 moveType = 0; moveType < MAX_MOVE_TYPE; ++moveType)
+                maxMoveTypeSpeed = std::max(maxMoveTypeSpeed,
+                    player->GetSpeed(static_cast<UnitMoveType>(moveType)));
+
+            float authorityAllowance = std::max({
+                4.0f,
+                std::min(maxMoveTypeSpeed, 40.0f) * 0.6f,
+                movementCtx.recentServerCanFly ? 60.0f : 0.0f
+            });
+
+            float serverGap = Dist3DToPoint(
+                movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY(),
+                movementInfo.pos.GetPositionZ(),
+                player->GetPositionX(), player->GetPositionY(),
+                player->GetPositionZ());
+
+            if (serverGap > authorityAllowance)
+            {
+                serverRelocatedPlayer = true;
+                ctx.lastTeleportMs = _elapsedMs;
+                ResetMovementDetectionState(ctx);
+            }
+        }
+    }
+
+    // The packet is still captured: DetectForceMove() identifies anti-knockback
+    // suppression by looking at the newest sample carrying
+    // CMSG_MOVE_KNOCK_BACK_ACK, so the ack has to reach the sample chain. What must
+    // not happen is that the *position* detectors read it as a travelled segment -
+    // its position is a landing snapshot, and treating a state transition as a
+    // segment invents a coordinate jump.
     CaptureSample(player, movementInfo, opcode, ctx);
     ConsumePendingTeleportArrival(ctx, ctx.samples.Newest(), _elapsedMs,
         cfg);
@@ -4706,10 +4829,12 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
     }
 
     bool suspicious = false;
-    if (ctx.samples.Size() >= 2)
+    if (ctx.samples.Size() >= 2 && !serverRelocatedPlayer &&
+        !IsNonMovementAckOpcode(opcode))
     {
         DecayRisk(ctx, _elapsedMs);
-        AegisMovementContext movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
+        if (!movementCtx.hasMap)
+            movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
         suspicious = RunMovementDetectors(player, ctx, movementCtx);
     }
 
@@ -4827,6 +4952,12 @@ bool AcAegisMgr::HandleDoubleJump(Player* player, Unit* mover)
     if (!player || !mover || player != mover || !IsEnabledFor(player))
         return true;
 
+    // ctx.lastJumpOpcodeMs, which feeds movementCtx.recentJump / recentExtendedJump, is
+    // set only here. The core's AnticheatSetJumpingbyOpcode hook cannot be used for it:
+    // both of its call sites pass false, so no script can observe a jump through it.
+    // This hook is called for MSG_MOVE_JUMP only, from VerifyMovementInfo, which runs
+    // before ProcessMovementInfo - so the timestamp is already set when the same
+    // packet's OnPlayerMove evaluates recentJump.
     AegisPlayerContext& ctx = GetOrCreate(player);
     AegisConfig const& cfg = sAcAegisConfig->Get();
     uint32 nowMs = _elapsedMs;
