@@ -1963,7 +1963,6 @@ std::string AcAegisMgr::BuildAuditCommonFields(Player* player, AegisPlayerContex
                     << ",\"gatherLoot\":" << ctx->gather.lootCount
                     << ",\"gatherNodes\":" << ctx->gather.gatherCount
                     << ",\"gatherMaxMoved\":" << ctx->gather.maxMoveInWindow
-                    << ",\"gatherCombatSeen\":" << (ctx->gather.recentCombatSeen ? "true" : "false")
                     << ",\"gatherSuspiciousWindows\":"
                     << ctx->gather.suspiciousWindows
                     << ",\"lastSeenMs\":" << ctx->lastSeenMs
@@ -2201,7 +2200,6 @@ void AcAegisMgr::ResetGatherWindow(Player* player, AegisPlayerContext& ctx, char
     ctx.gather.startY = player->GetPositionY();
     ctx.gather.startZ = player->GetPositionZ();
     ctx.gather.maxMoveInWindow = 0.0f;
-    ctx.gather.recentCombatSeen = false;
     ctx.gather.lastSource.clear();
 }
 
@@ -2217,16 +2215,21 @@ void AcAegisMgr::TouchGatherWindow(Player* player, AegisPlayerContext& ctx, char
 
     // Looting or gathering while in combat means the player is actively fighting, not
     // running a fixed-position farm loop. Restart the window instead of counting it,
-    // otherwise stationary AoE farming can drift towards the AFK threshold. The flag is
-    // also sticky for the current window: combat between two counted actions marks the
-    // window as "not a pure gathering loop", so a camp that fights is not reported.
+    // otherwise stationary AoE farming can drift towards the AFK threshold: an action
+    // taken in combat never counts, and it also clears everything the window had
+    // accumulated, so a camp that fights cannot build up to the action/loot/gather
+    // minimums either.
+    //
+    // This is the whole of the "a camp that fights is not reported" rule. An earlier
+    // revision also kept a sticky "combat seen" flag on the gather state, but the flag
+    // was set *after* the reset below and therefore landed on the fresh window - which
+    // had seen no combat at all - and, because a stationary player never triggers
+    // another reset, it stayed set indefinitely and disabled DetectAfk for that player.
+    // The restart already rejects the combat window, so the flag was redundant as well
+    // as wrong.
     if (player->IsInCombat())
     {
-        // Set the sticky flag before resetting: ResetGatherWindow clears it, and the
-        // "this window is not a pure gathering loop" fact has to survive the restart.
-        ctx.gather.recentCombatSeen = true;
         ResetGatherWindow(player, ctx, "in-combat");
-        ctx.gather.recentCombatSeen = true;
         return;
     }
 
@@ -3180,25 +3183,22 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectAfk(Player* player, AegisPla
     if (!movementCtx.isAlive || movementCtx.isInCombat || movementCtx.isTaxiFlight || movementCtx.hasTransport || movementCtx.hasVehicle)
         return std::nullopt;
 
-    // This realm does not allow camping a spawn point, so a character that never
-    // leaves one spot across the whole window is the violation, and the check must
-    // clear it rather than block it. Two window-wide facts decide that:
-    //  - maxMoveInWindow is the largest distance reached at any counted action. A
-    //    normal player gathering across a zone travels well past afkMaxMoveDistance,
-    //    which resets the window anyway; using the running maximum (not the current
-    //    position) means "gather, step away, come back" cannot hide behind a small
-    //    final distance;
-    //  - recentCombatSeen records that the player was in combat at a counted action,
-    //    so killing a mob that wandered into the camp still disqualifies that window.
-    if (!movementCtx.isAlive || movementCtx.isTaxiFlight || movementCtx.hasTransport || movementCtx.hasVehicle)
-        return std::nullopt;
-
+    // This realm does not allow camping a spawn point, so a character that never leaves
+    // one spot across the whole window is the violation, and the check must clear it
+    // rather than block it. maxMoveInWindow is the largest distance reached at any
+    // counted action - using the running maximum rather than the current position means
+    // "gather, step away, come back" cannot hide behind a small final distance, and a
+    // normal player gathering across a zone travels well past afkMaxMoveDistance, which
+    // resets the window anyway.
     float moved = Dist3DToPoint(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), ctx.gather.startX, ctx.gather.startY, ctx.gather.startZ);
     if (moved > cfg.afkMaxMoveDistance)
         return std::nullopt;
 
-    bool campedInPlace = ctx.gather.maxMoveInWindow <= cfg.afkCampStationaryEpsilon;
-    if (!campedInPlace || ctx.gather.recentCombatSeen)
+    // Actions taken while in combat restart the window instead of counting (see
+    // TouchGatherWindow), so every action in a window that reaches this point was taken
+    // out of combat. Combat that never overlaps a counted action is invisible to this
+    // detector by design - it only samples the player at loot/gather time.
+    if (ctx.gather.maxMoveInWindow > cfg.afkCampStationaryEpsilon)
         return std::nullopt;
 
     AegisEvidenceEvent evidence;
@@ -4652,6 +4652,24 @@ void AcAegisMgr::OnCanFlyByServer(Player* player, bool apply)
         return;
 
     AegisPlayerContext& ctx = GetOrCreate(player);
+
+    // The core feeds this hook the CAN_FLY bit of the *client's* movement-flag ack
+    // (MiscHandler.cpp:1522, before the order-counter validation at :1530), so a modified
+    // client can claim flight at any moment and keep the claim alive by re-sending the
+    // ack. Treating that as server authorization would hand out the aerial exemptions
+    // (shouldSkipAerialDetectors, the aerial boundary state) on demand.
+    //
+    // A grant is only accepted while the server itself is waiting for one, which is the
+    // core's own predicate: Unit::SetCanFly() records the order counter it sent in
+    // _pendingFlightChangeCounter and increments the session counter
+    // (Unit.cpp:16156-16165), and both the login and worldport handlers then test
+    // GetPendingFlightChange() <= GetMapChangeOrderCounter() to mean "nothing pending"
+    // (CharacterHandler.cpp:1199, MovementHandler.cpp:110). A revocation still has to be
+    // honoured unconditionally: clearing the authorization can only make detection
+    // stricter, never looser.
+    if (apply && player->GetPendingFlightChange() <= player->GetMapChangeOrderCounter())
+        return;
+
     bool changed = ctx.serverCanFly != apply;
     ctx.serverCanFly = apply;
     ctx.lastCanFlyServerMs = _elapsedMs;
@@ -4682,9 +4700,19 @@ void AcAegisMgr::OnUnderAckMount(Player* player)
     // _MOUNTED_SPEED_ALWAYS, _SPEED_NOT_STACK, _MOUNTED_SPEED_NOT_STACK,
     // _MINIMUM_SPEED and the six flight speed auras.
     //
-    // Split mount from server-issued displacement so the grace matches what actually
-    // happened, and so the displacement grace comes from the server rather than from
-    // a client packet.
+    // Split mount from server-issued displacement so that each grace window is named for
+    // the event that produced it, and so the displacement grace comes from the server
+    // rather than from a client packet.
+    //
+    // Caveat, deliberately accepted: the split keys off the player's *state*, not off the
+    // caller, so a knockback or pull received while mounted is recorded as mount grace,
+    // and every forced speed-change ack of an unmounted player (HandleForceSpeedChangeAck,
+    // MovementHandler.cpp:746 - 11 of the 28 call sites are ordinary speed-aura
+    // recalculations) is recorded as a server displacement. The two windows only differ in
+    // length (mountGraceMs 2500 vs forceMoveGraceMs 1200; the latter is also gated by
+    // ForceMove.Enabled) and both make ShouldSkipAllMovementDetectors() true, so this is a
+    // labelling/window-length approximation, not a hole: it cannot make a detector see a
+    // server move as a cheat, and it cannot widen a grace beyond mountGraceMs.
     bool looksLikeMount = player->IsMounted() ||
         player->HasIncreaseMountedSpeedAura() ||
         player->HasIncreaseMountedFlightSpeedAura();
@@ -4778,66 +4806,21 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
 
     SyncMovementBoundaryState(player, movementInfo, ctx, _elapsedMs);
 
-    // Build the movement context once and reuse it: it walks the applied aura list
-    // several times, so it must not be built twice on the same packet.
-    AegisMovementContext movementCtx;
-
-    // Server-authoritative displacement check.
-    //
-    // Only Player::TeleportTo runs the OnPlayerBeforeTeleport hook, so the module gets
-    // no grace when the core or a script moves a player with Unit::NearTeleportTo.
-    // That covers battleground spawn and fence resets, vehicle relocation, transports,
-    // the Warlock demonic circle and a number of boss mechanics. Such a move changes
-    // player->GetPositionX/Y/Z without running the hook, so the next movement packet
-    // reports a large displacement that DetectTeleport reads as a coordinate teleport
-    // and then rolls the player back.
-    //
-    // The packet position and the server unit position normally agree to within one
-    // packet interval of movement plus latency: HandleMoverRelocation runs on
-    // essentially every accepted movement packet, knockback included. A gap beyond
-    // that can only come from an external relocation of the unit. When one is seen the
-    // sample chain is restarted and the segment detectors are skipped for this packet,
-    // so the packet that merely reports the forced landing is not mistaken for a
-    // client teleport. SyncMovementBoundaryState has already absorbed the new position
-    // as the observed boundary, so the next packet compares against it.
-    //
-    // This is not a blind spot for repeated cheating: a client-side teleport never
-    // moves player->GetPositionX/Y/Z, so the gap stays large on every such packet and
-    // the check keeps firing while the evidence stays suppressed. It trades a little
-    // teleport coverage for removing the harmful rollback.
-    bool serverRelocatedPlayer = false;
-    if (!IsNonMovementAckOpcode(opcode))
-    {
-        movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
-
-        if (!movementCtx.isBeingTeleported && !movementCtx.isTaxiFlight &&
-            !movementCtx.hasTransport && !movementCtx.hasVehicle)
-        {
-            float maxMoveTypeSpeed = 0.0f;
-            for (uint8 moveType = 0; moveType < MAX_MOVE_TYPE; ++moveType)
-                maxMoveTypeSpeed = std::max(maxMoveTypeSpeed,
-                    player->GetSpeed(static_cast<UnitMoveType>(moveType)));
-
-            float authorityAllowance = std::max({
-                4.0f,
-                std::min(maxMoveTypeSpeed, 40.0f) * 0.6f,
-                movementCtx.recentServerCanFly ? 60.0f : 0.0f
-            });
-
-            float serverGap = Dist3DToPoint(
-                movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY(),
-                movementInfo.pos.GetPositionZ(),
-                player->GetPositionX(), player->GetPositionY(),
-                player->GetPositionZ());
-
-            if (serverGap > authorityAllowance)
-            {
-                serverRelocatedPlayer = true;
-                ctx.lastTeleportMs = _elapsedMs;
-                ResetMovementDetectionState(ctx);
-            }
-        }
-    }
+    // There is deliberately no "did the server move me?" distance test here: it cannot
+    // work from this hook. OnPlayerMove fires inside WorldSession::ProcessMovementInfo
+    // (MovementHandler.cpp:660), before HandleMoverRelocation (:670) reaches
+    // Unit::UpdatePosition (:434), so player->GetPosition*() is still the position of the
+    // previous accepted packet and the gap to movementInfo.pos is simply this packet's
+    // travelled distance - a lag spike, a fast mount or a speed hack, not a relocation.
+    // Reading a large gap as a server relocation suppressed the very evidence the
+    // teleport and speed detectors look for (their thresholds start at 4.5 yd, below any
+    // plausible per-packet allowance), while the relocations it was meant to tolerate are
+    // already covered: Player::TeleportTo runs OnPlayerBeforeTeleport (Player.cpp:1498),
+    // Unit::NearTeleportTo delegates to it for a player (Unit.cpp:15537-15541), and the
+    // teleport semaphore plus the transport/vehicle/taxi state are all checked by
+    // BuildMovementContext(). If a relocation ever does slip through, the core's
+    // sanctioned one-shot latches Player::CanTeleport()/CanKnockback() (Player.h:2546-2549)
+    // are the right signal - not a distance guess.
 
     // The packet is still captured: DetectForceMove() identifies anti-knockback
     // suppression by looking at the newest sample carrying
@@ -4857,13 +4840,18 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
     }
 
     bool suspicious = false;
-    if (ctx.samples.Size() >= 2 && !serverRelocatedPlayer &&
-        !IsNonMovementAckOpcode(opcode))
+    if (ctx.samples.Size() >= 2)
     {
         DecayRisk(ctx, _elapsedMs);
-        if (!movementCtx.hasMap)
-            movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
-        suspicious = RunMovementDetectors(player, ctx, movementCtx);
+        // Built once per packet and reused by every detector: it walks the applied aura
+        // list several times, so building it twice on the same packet is pure overhead.
+        AegisMovementContext movementCtx = BuildMovementContext(player, ctx, _elapsedMs);
+        // A control-flow acknowledgement or state-change packet carries a landing or
+        // snapshot position, not a travelled segment, so the segment detectors must not
+        // read it as movement. DetectForceMove() is exempt from that gate because it
+        // reads the knockback ack sample itself.
+        suspicious = RunMovementDetectors(player, ctx, movementCtx,
+            !IsNonMovementAckOpcode(opcode));
     }
 
     // Record the rollback target only after the detectors inspected this sample, and
@@ -4876,13 +4864,22 @@ void AcAegisMgr::OnPlayerMove(Player* player, MovementInfo movementInfo, uint32 
 }
 
 bool AcAegisMgr::RunMovementDetectors(Player* player, AegisPlayerContext& ctx,
-    AegisMovementContext const& movementCtx)
+    AegisMovementContext const& movementCtx, bool allowSegmentDetectors)
 {
+    // DetectForceMove() judges anti-knockback suppression from the newest sample carrying
+    // CMSG_MOVE_KNOCK_BACK_ACK - and that ack is one of the opcodes the segment detectors
+    // skip, because its position is a landing snapshot rather than a travelled segment.
+    // It therefore has to run before that gate, otherwise it would never see the sample it
+    // looks for. Its own preconditions (forceMoveEnabled, sample count, the skip-all
+    // grace check) still apply.
     if (std::optional<AegisEvidenceEvent> evidence = DetectForceMove(player, ctx, movementCtx))
     {
         HandleEvidence(player, ctx, *evidence);
         return true;
     }
+
+    if (!allowSegmentDetectors)
+        return false;
 
     if (std::optional<AegisEvidenceEvent> evidence = DetectControlledMove(player, ctx, movementCtx))
     {

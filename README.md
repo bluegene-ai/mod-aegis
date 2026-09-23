@@ -169,9 +169,10 @@ To release every currently punished player immediately, use `.aegis purge`
   allowed, so standing still is itself the violation, and the detector must clear it
   rather than block it. Two window-wide facts keep it off legitimate play:
   `maxMoveInWindow` is the largest distance reached at any counted action (not the
-  final position), so "gather, step away, come back" cannot hide; and being in combat
-  at a counted action marks the window as not a pure gathering loop. A player who
-  gathers while travelling leaves `MaxMoveDistance`, which resets the window entirely.
+  final position), so "gather, step away, come back" cannot hide; and an action taken
+  while in combat is not counted at all and also restarts the window, so a camp that
+  fights can never accumulate the action/loot/gather minimums. A player who gathers
+  while travelling leaves `MaxMoveDistance`, which resets the window entirely.
 - `.aegis delete` and `.aegis purge` wait at most 5 seconds for the queued event rows
   to be handed to the asynchronous queue. On expiry the command still runs and logs a
   warning naming the guid and the timeout, so the operator is told the delete may not

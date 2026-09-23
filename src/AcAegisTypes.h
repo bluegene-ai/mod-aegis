@@ -171,9 +171,6 @@ struct AegisGatherState
     // current position alone is not enough to tell a planted character from one that
     // moved away and came back between actions.
     float maxMoveInWindow = 0.0f;
-    // Set when a counted action happened while the player was in combat. A camp that
-    // also fights is not a pure gathering loop, so it is not reported.
-    bool recentCombatSeen = false;
     std::string lastSource;
 };
 

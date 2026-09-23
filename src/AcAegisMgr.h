@@ -148,7 +148,7 @@ private:
     std::optional<AegisEvidenceEvent> DetectAfk(Player* player, AegisPlayerContext& ctx, AegisMovementContext const& movementCtx) const;
 
     bool HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEvidenceEvent const& evidence);
-    bool RunMovementDetectors(Player* player, AegisPlayerContext& ctx, AegisMovementContext const& movementCtx);
+    bool RunMovementDetectors(Player* player, AegisPlayerContext& ctx, AegisMovementContext const& movementCtx, bool allowSegmentDetectors);
     AegisActionDecision DetermineAction(Player* player, AegisPlayerContext const& ctx, AegisEvidenceEvent const& evidence) const;
     bool ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvidenceEvent const& evidence, AegisActionDecision const& decision);
     bool QueuePendingAction(Player* player, AegisEvidenceEvent const& evidence, AegisActionDecision const& decision);

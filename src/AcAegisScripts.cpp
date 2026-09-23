@@ -395,6 +395,20 @@ public:
     }
 };
 
+// NOTE: vehicles have no global hook in this core. VehicleScript carries no hook list and
+// ScriptMgr dispatches OnAddPassenger/OnRemovePassenger only to the single script bound to
+// the vehicle creature's script id (VehicleScript.cpp:67-89, keyed on
+// veh->GetBase()->ToCreature()->GetScriptId()). A code-only VehicleScript is filed under
+// the registry's internal counter, which starts at 0 (ScriptMgr.h:816, :936), and most
+// vehicle creatures have script id 0 - so this script is reached today only because it
+// happens to take id 0, and another module registering a VehicleScript first (mod-ale does:
+// modules/mod-ale/src/ALE_SC.cpp:1039) would silently take that slot and make these two
+// callbacks dead.
+//
+// Nothing here is load-bearing: OnVehicleTransition() only refreshes a grace window and
+// resets detection state, and SyncMovementBoundaryState() (AcAegisMgr.cpp) already detects
+// the vehicle boundary change from player->GetVehicle() on every movement packet. Treat
+// this script as an optimisation, not as the source of truth.
 class AcAegisVehicleScript : public VehicleScript
 {
 public:
