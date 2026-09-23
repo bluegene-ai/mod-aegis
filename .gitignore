@@ -5,3 +5,11 @@ docs/aegis.log
 
 # Editor / tooling state for this module
 .codebase-memory/
+
+# Documentation is local working material: document edits are not committed. The README is
+# the only document that ships with the module. docs/.gitignore already ignored docs/*.md,
+# but that rule does not reach markdown kept outside docs/, and no .gitignore rule has any
+# effect on files that are already tracked - which is why the previously tracked docs were
+# removed from the index when this rule was added.
+*.md
+!/README.md
