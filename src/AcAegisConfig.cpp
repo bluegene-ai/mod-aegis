@@ -137,6 +137,10 @@ void AcAegisConfig::Reload()
     _config.noClipCumulativeWindowMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.NoClip.CumulativeWindowMs", 1800);
     _config.noClipCumulativeMinDistance = sConfigMgr->GetOption<float>("AcAegis.Detector.NoClip.CumulativeMinDistance", 2.8f);
     _config.noClipCumulativeStrongHits = sConfigMgr->GetOption<uint32>("AcAegis.Detector.NoClip.CumulativeStrongHits", 3);
+    _config.noClipDoorCrossEnabled = sConfigMgr->GetOption<bool>("AcAegis.Detector.NoClip.DoorCross.Enabled", true);
+    _config.noClipDoorCrossHalfWidthYards = sConfigMgr->GetOption<float>("AcAegis.Detector.NoClip.DoorCross.HalfWidthYards", 2.0f);
+    _config.noClipDoorOpenGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.NoClip.DoorCross.OpenGraceMs", 8000);
+    _config.noClipDoorCrossActionable = sConfigMgr->GetOption<bool>("AcAegis.Detector.NoClip.DoorCross.Actionable", false);
 
     _config.flyEnabled = sConfigMgr->GetOption<bool>("AcAegis.Detector.Fly.Enabled", true);
     _config.flyMinHeightAboveGround = sConfigMgr->GetOption<float>("AcAegis.Detector.Fly.MinHeightAboveGround", 6.0f);
@@ -161,7 +165,7 @@ void AcAegisConfig::Reload()
     _config.mountIndoorMinMoveDistance = sConfigMgr->GetOption<float>("AcAegis.Detector.Mount.IndoorMinMoveDistance", 0.5f);
 
     _config.forceMoveEnabled = sConfigMgr->GetOption<bool>("AcAegis.Detector.ForceMove.Enabled", true);
-    _config.forceMoveGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.ForceMove.GraceMs", 1200);
+    _config.forceMoveGraceMs = sConfigMgr->GetOption<uint32>("AcAegis.Detector.ForceMove.GraceMs", 2000);
     _config.forceMoveMinAckSpeedXY = sConfigMgr->GetOption<float>("AcAegis.Detector.ForceMove.MinAckSpeedXY", 4.0f);
     _config.forceMoveMinAckSpeedZ = sConfigMgr->GetOption<float>("AcAegis.Detector.ForceMove.MinAckSpeedZ", 2.5f);
     _config.forceMoveExpectedFactor = sConfigMgr->GetOption<float>("AcAegis.Detector.ForceMove.ExpectedFactor", 0.25f);
@@ -199,11 +203,14 @@ void AcAegisConfig::Reload()
     _config.afkCampStationaryEpsilon = sConfigMgr->GetOption<float>("AcAegis.Detector.Afk.CampStationaryEpsilon", 0.25f);
     _config.afkIgnoreSpellIds = ParseIdList(sConfigMgr->GetOption<std::string>("AcAegis.Detector.Afk.IgnoreSpellIds", ""));
     _config.afkIgnoreAuras = ParseIdList(sConfigMgr->GetOption<std::string>("AcAegis.Detector.Afk.IgnoreAuras", ""));
+    _config.afkIgnoreFishing = sConfigMgr->GetOption<bool>("AcAegis.Detector.Afk.IgnoreFishing", true);
 
     _config.geometryEnabled = sConfigMgr->GetOption<bool>("AcAegis.Geometry.Enabled", true);
     _config.useVmaps = sConfigMgr->GetOption<bool>("AcAegis.Geometry.UseVmaps", true);
     _config.useMmaps = sConfigMgr->GetOption<bool>("AcAegis.Geometry.UseMmaps", true);
     _config.allowHotPathReachability = sConfigMgr->GetOption<bool>("AcAegis.Geometry.AllowHotPathReachability", false);
+    _config.pathBudgetSpeedFactor = sConfigMgr->GetOption<float>("AcAegis.Geometry.PathBudgetSpeedFactor", 1.5f);
+    _config.pathBudgetSlackYards = sConfigMgr->GetOption<float>("AcAegis.Geometry.PathBudgetSlackYards", 1.0f);
 
     _config.notifyThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.NotifyThreshold", 60.0f);
     _config.rollbackThreshold = sConfigMgr->GetOption<float>("AcAegis.Risk.RollbackThreshold", 110.0f);
@@ -317,6 +324,7 @@ void AcAegisConfig::Reload()
     _config.noClipCumulativeWindowMs = std::max<uint32>(200, _config.noClipCumulativeWindowMs);
     _config.noClipCumulativeMinDistance = std::max(_config.noClipMinSegmentDistance, _config.noClipCumulativeMinDistance);
     _config.noClipCumulativeStrongHits = std::max<uint32>(1, _config.noClipCumulativeStrongHits);
+    _config.noClipDoorOpenGraceMs = std::max<uint32>(0, _config.noClipDoorOpenGraceMs);
 
     _config.flyMinHeightAboveGround = std::max(1.0f, _config.flyMinHeightAboveGround);
     _config.flySustainMinHorizontalDistance = std::max(0.5f, _config.flySustainMinHorizontalDistance);

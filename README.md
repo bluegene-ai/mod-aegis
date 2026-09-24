@@ -199,6 +199,38 @@ To release every currently punished player immediately, use `.aegis purge`
   `MapCollisionData::GetStaticTree()/GetDynamicTree()`, so
   `AcAegis.Detector.NoClip.MinRemainingDistance` measures the real distance from
   the hit point to the destination.
+- The closed-door rule (`AcAegis.Detector.NoClip.DoorCross.*`) is recorded but **not
+  actionable by default**. Walking through a door whose server state is `GO_STATE_READY`
+  looks the same whether the client removed the door collision or merely still shows the
+  door as open - a loading screen, a missed state update, or another player having toggled
+  the door all produce identical evidence, because the door's state and the door's
+  collision are two views of the same server-side value (`GameObject::SetGoState()` flips
+  both). Set `DoorCross.Actionable = 1` to treat it as Strong evidence again. Even then the
+  rule requires the door to have been closed **before the judged segment started**:
+  `DoorCross.OpenGraceMs` must stay well above the door's own `autoCloseTime`, and it is
+  now 8000 ms against the 3000 ms auto-close of the Scarlet Monastery wing doors - the
+  2026-09-23 production log jailed a player for 2 hours because both values were 3000 ms.
+- Every `evidence` audit line carries the movement diagnostics of the sample that produced
+  it (`sampleDtMs`, `sampleClientLeadMs`, `sampleAllowedSpeed`, `sampleLatencyMs`,
+  `sampleMoveFlags`, `sampleMoveFlags2`, `sampleOpcode`, `sampleX/Y/Z`), and no longer
+  depends on `AcAegis.Log.Verbose`. Blocked-segment evidence also reports which collision
+  layer produced the hit (`|blocker=static|dynamic`) and door evidence reports the door
+  state, how long it had been closed and whether it was actionable. Without those fields a
+  speed event cannot be told apart from a server displacement whose grace had just expired.
+- The audit only claims what actually happened: `Rollback()` and `Jail()` report whether the
+  player was really moved, so a deferred sentence is no longer logged as `jail-applied`
+  (it is logged as `jail-deferred-unsafe-state` and applied by the jail leash), and a
+  rollback that was refused is not announced or broadcast. A queued punishment that is
+  dropped (`action_dropped`) now says why - previously a decision could disappear without
+  any trace between the `evidence` row and the `action` row.
+- Casting Fishing (spell `7620`) refreshes the AFK gather grace when
+  `AcAegis.Detector.Afk.IgnoreFishing = 1` (default): fishing is the one legitimate
+  activity that is a perfect match for the "never moved, only looted, no gathering skill"
+  window shape, so an angler was indistinguishable from a fixed-position farm bot. Set it
+  to 0 on a realm that wants fishing bots reported.
+- `AcAegis.Detector.ForceMove.GraceMs` is 2000 ms: a knockback or pull trajectory commonly
+  lasts longer than a second, and a shorter grace turns the tail of a legitimate
+  displacement into speed evidence.
 
 ## Known limits
 

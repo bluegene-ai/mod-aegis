@@ -344,6 +344,44 @@ AcAegis.Detector.NoClip.CumulativeMinDistance = 2.8
 # 一个累计窗口内至少命中多少次，才升级为强穿墙证据。
 AcAegis.Detector.NoClip.CumulativeStrongHits = 3
 
+# 是否启用“穿过关闭状态的门”判定。
+# 门在服务器端按状态管理碰撞：关门有碰撞、开门无碰撞（GameObject::SetGoState ->
+# EnableCollision(state == GO_STATE_READY)）。而合法客户端的门只有在服务器把状态翻成
+# 打开之后才允许通过，所以“穿过一扇此刻服务器认为是关闭的门”说明客户端碰撞可能被改过
+# （例如自制 MPQ 去掉门碰撞），且这个判据完全不依赖碰撞数据：
+# 即使门的模型缺失、被 LoS 禁用或在 vmap 里被烘焙成开着的，它依然有效。
+#
+# 重要（2026-09-24 生产日志复核后的默认行为变更）：
+# 本判定默认只产出 **Weak（仅记录）** 证据，不自动回滚、不进入处罚阶梯。
+# 原因：门的“状态事实”和“碰撞互证”并不独立——两者都是服务器同一份 GO 状态的两个视图
+# （SetGoState 同时翻状态和碰撞）。因此“客户端仍显示门开着（读图丢包、错过状态更新、
+# 别人刚开关过门）而服务器已关闭”这一合法情形，产生的证据与“改 MPQ 去碰撞”完全一样。
+# 2026-09-23 生产日志中 21:02/21:07 两条 ClosedDoorCross 把一名正在正常刷血色修道院的
+# 玩家监禁 2 小时，属于这类误报。若要恢复自动处罚，请同时满足：
+#   1) 把下面的 Actionable 设为 1；
+#   2) 确认 OpenGraceMs 明显大于门的 autoCloseTime（本服 SM 门为 3000ms）；
+#   3) 事后核对 ac_aegis_event，确认不是读图/状态失同步导致的重复事件。
+AcAegis.Detector.NoClip.DoorCross.Enabled = 1
+
+# 门宽判定的半宽，单位码。
+# 穿越点距离门中心在该范围内才算“从门里穿过”，避免把从门旁通道经过的玩家算进来。
+# 调小更严格（可能漏掉宽门），调大更宽松（可能误判门旁的通道）。
+AcAegis.Detector.NoClip.DoorCross.HalfWidthYards = 2.0
+
+# 门的“刚被打开”宽限时间，单位毫秒。
+# 门打开后自动关闭时，玩家可能仍在门洞里（或客户端尚未收到状态更新），
+# 这段时间内不判定为穿门作弊。
+# 注意：该值必须明显大于门的 autoCloseTime（gameobject_template.data2），否则“开门后正常
+# 走过去”就可能被判成穿门——2026-09-23 的误报正是因为两者都等于 3000ms。
+# 本服 SM 门（101850/101851）autoCloseTime = 3000ms，故默认 8000ms。
+AcAegis.Detector.NoClip.DoorCross.OpenGraceMs = 8000
+
+# 关闭的门穿越是否可作为“可执行”证据（强证据 → 回滚 + 处罚阶梯）。
+# 0 = 只记录（Weak，默认且推荐）；1 = 允许按强证据处理，仅在确认本服不存在门状态失同步时开启。
+# 另外：无论该值如何，只有在“线段开始时门就已经是关闭的”（即门不是在这次判定所覆盖的
+# 时间段内才被关上）时才会视为可执行，避免“开门→走过去→门自动关闭”被判成穿门。
+AcAegis.Detector.NoClip.DoorCross.Actionable = 0
+
 ###################################################################################################
 # Detector / Fly / 飞行与滞空
 ###################################################################################################
@@ -431,7 +469,9 @@ AcAegis.Detector.ForceMove.Enabled = 1
 
 # 合法击退 ACK 后，通用移动检测跳过的宽限时间，单位毫秒。
 # 用于避免正常 knockback 轨迹误触发速度/飞行/传送类检测。
-AcAegis.Detector.ForceMove.GraceMs = 1200
+# 击退/拉拽的轨迹常常持续 1-2 秒，宽限若短于轨迹长度，位移尾段就会被当成“速度外挂”
+# （2026-09-23 生产日志里两段孤立的 SpeedEnvelope = 徒步 24-30 码/秒，很可能属于此类）。
+AcAegis.Detector.ForceMove.GraceMs = 2000
 
 # 进入受击位移异常评估时，ACK 包要求的最小水平速度。
 AcAegis.Detector.ForceMove.MinAckSpeedXY = 4.0
@@ -568,6 +608,13 @@ AcAegis.Detector.Afk.IgnoreSpellIds =
 # AFK 忽略 Aura 白名单。
 AcAegis.Detector.Afk.IgnoreAuras =
 
+# 是否把“钓鱼”视为合法定点行为而豁免 AFK 采集判定。
+# 钓鱼是本服唯一“站着不动、不涨采集技能、只产生拾取”的合法玩法，其窗口形态与定点脚本
+# 完全一致（0 位移 + 大量 loot + 0 采集节点），因此默认豁免：玩家每次抛竿（法术 7620）
+# 都会刷新与 IgnoreSpellIds 相同的宽限窗口（AcAegis.Detector.Afk.IgnoreActionGraceMs）。
+# 若本服希望连钓鱼脚本一起抓，设为 0（此时建议同时收紧 MinActions / 提高证据要求）。
+AcAegis.Detector.Afk.IgnoreFishing = 1
+
 ###################################################################################################
 # Geometry / 地图几何
 ###################################################################################################
@@ -580,12 +627,26 @@ AcAegis.Geometry.Enabled = 1
 AcAegis.Geometry.UseVmaps = 1
 
 # 是否使用 MMAP / 路径系统。
-# 关闭后，BlockedMicroPath 不再使用 MMAP 长路径复核，只保留短线段几何判定。
+# 路径复核用于区分“绕过障碍物的合法曲线路径”和“穿过墙体”：
+# 关闭后，凡是被视线射线判定为被挡的线段（BlockedSegment / BlockedMicroPath）都不再做 MMAP 复核，
+# 只保留短线段几何判定，误报率会明显升高。
 AcAegis.Geometry.UseMmaps = 1
 
 # 是否允许在热点路径直接做 reachability 检查。
 # 1 会更严格，但 CPU 开销也更高。
 AcAegis.Geometry.AllowHotPathReachability = 0
+
+# 路径预算：MMAP 复核判定“这条被挡的线段是否其实是绕行”时，允许绕行路径消耗的速度倍数。
+# 判定式：绕行路径长度 <= 移动速度 * 采样间隔 * 该倍数，且不低于 直线距离 + 下面的余量。
+# 合理值来源：穿墙检测本身已允许 1.5 倍速度容差（Detector.NoClip.MaxSpeedMultiplier），
+# 因此“时间 * 1.5 倍速度”就是玩家在这段时间里物理上最多能走的距离；
+# 绕树/绕晶簇/贴墙角跑出来的曲线路径都在这条预算内，穿墙则远远超出。
+# 调大更宽松（误报更少，可能漏掉贴着薄墙的短距穿越）；调小更严格。
+AcAegis.Geometry.PathBudgetSpeedFactor = 1.5
+
+# 路径预算余量，单位码。
+# 用于补偿 MMAP 折线近似、采样时间抖动与寻路栅格化误差。
+AcAegis.Geometry.PathBudgetSlackYards = 1.0
 
 ###################################################################################################
 # Risk Thresholds / 风险阈值

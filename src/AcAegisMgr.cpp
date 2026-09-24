@@ -18,6 +18,7 @@
 #include "BanMgr.h"
 #include "CharacterCache.h"
 #include "Chat.h"
+#include "GameObject.h"
 #include "GridTerrainData.h"
 #include "Log.h"
 #include "Map.h"
@@ -2019,6 +2020,10 @@ std::string AcAegisMgr::BuildGmMessage(Player* player, AegisEvidenceEvent const&
                 << " tier=" << static_cast<uint32>(ctx.punish.offenseTier)
                 << " action=" << ActionText(decision)
                 << " tag=" << evidence.tag;
+        // A stationary loot loop looks the same for an angler and for a farm bot, so the window
+        // counters belong in the notification the duty GM actually reads.
+        if (evidence.cheatType == AegisCheatType::Afk)
+            message << " detail=" << evidence.detail;
     }
 
     return message.str();
@@ -2581,6 +2586,87 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
 
     ctx.lastGeometryCheckMs = cur.serverMs;
     AegisGeometryResult geometry = _geometry.CheckShortSegment(player, *start, cur, cfg.allowHotPathReachability);
+
+    // A closed door is a state fact, not only a collision fact. An unmodified client cannot
+    // walk through one - its own collision only opens once the server flips the gameobject
+    // state - so crossing a closed door means the client collision was removed, which is the
+    // "custom MPQ" cheat. This runs even when the collision trees call the segment clear,
+    // because a door whose model is missing, disabled for LoS or baked open in the vmaps is
+    // invisible to them. Doors opened within the grace window are excused (auto-close while
+    // the player is still walking through, or a client that has not caught up yet).
+    //
+    // This rule is a hint by default, not a conviction: the door's state and the door's
+    // collision are two views of the same server-side state, so a client that still shows the
+    // door open (loading screen, missed state update, another player having toggled it)
+    // produces exactly the same evidence as a client with the collision removed. It therefore
+    // only produces actionable (Strong) evidence when the operator asks for it
+    // (NoClip.DoorCross.Actionable) *and* the door was already closed when the segment began.
+    if (cfg.noClipDoorCrossEnabled)
+    {
+        AegisDoorCrossResult doorCross = _geometry.CheckClosedDoorCross(player, *start, cur,
+            geometry.hitX, geometry.hitY, geometry.hitZ, geometry.hitValid);
+
+        if (doorCross.crossed && doorCross.door)
+        {
+            uint32 closedSinceMs = 0;
+            bool closedBeforeSegment = IsDoorClosedSince(doorCross.door->GetGUID(), start->serverMs, closedSinceMs);
+            bool recentlyOpened = IsDoorRecentlyOpened(doorCross.door->GetGUID(), cur.serverMs);
+
+            // A door that was opened, or that closed, inside the judged segment is never
+            // evidence: the player may legitimately have started crossing while it was open,
+            // and the state is read now rather than when the segment was walked.
+            if (!recentlyOpened && closedBeforeSegment)
+            {
+                bool actionable = doorCross.collisionConfirmed && cfg.noClipDoorCrossActionable;
+
+                AegisEvidenceEvent doorEvidence;
+                doorEvidence.cheatType = AegisCheatType::NoClip;
+                doorEvidence.serverMs = cur.serverMs;
+                doorEvidence.metricA = geometry.directDistance;
+                doorEvidence.metricB = doorCross.lateralOffset;
+
+                std::ostringstream doorDetail;
+                doorDetail << "door=" << doorCross.door->GetEntry()
+                           << ",lateral=" << doorCross.lateralOffset
+                           << ",collision=" << (doorCross.collisionConfirmed ? "confirmed" : "unconfirmed")
+                           << ",closedFor=" << (closedSinceMs ? std::to_string(cur.serverMs - closedSinceMs) : std::string("unknown"))
+                           << ",actionable=" << (actionable ? "1" : "0");
+
+                if (actionable)
+                {
+                    // Collision and door state agree and the door was already closed when the
+                    // segment started. One crossing is enough, so the repeated-hit counter is
+                    // deliberately bypassed.
+                    doorEvidence.level = AegisEvidenceLevel::Strong;
+                    doorEvidence.tag = "ClosedDoorCross";
+                    doorEvidence.riskDelta = ClampRiskDelta(18.0f);
+                    doorEvidence.shouldRollback = true;
+                    doorEvidence.geometryConfirmed = true;
+                    doorEvidence.geometryReason = "closed-door-cross";
+                }
+                else
+                {
+                    // Recorded for triage, deliberately not actionable: the state fact alone
+                    // cannot be told apart from a client whose door state is stale, and the
+                    // collision hit is not an independent witness (both come from the same
+                    // server-side gameobject state). Weak evidence never rolls back and never
+                    // reaches the punishment ladder.
+                    doorEvidence.level = AegisEvidenceLevel::Weak;
+                    doorEvidence.tag = "ClosedDoorCross";
+                    doorEvidence.riskDelta = ClampRiskDelta(4.0f);
+                    doorEvidence.shouldRollback = false;
+                    doorEvidence.geometryConfirmed = doorCross.collisionConfirmed;
+                    doorEvidence.geometryReason = doorCross.collisionConfirmed ?
+                        "closed-door-cross-observed" : "closed-door-cross-state";
+                }
+
+                doorEvidence.detail = doorDetail.str();
+                resetWindow();
+                return doorEvidence;
+            }
+        }
+    }
+
     if (!geometry.blocked)
     {
         resetWindow();
@@ -2589,21 +2675,24 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
 
     AegisGeometryResult longPath;
     bool hasLongPath = false;
-    if (cumulativePath && cfg.useMmaps)
+    if (cfg.useMmaps)
     {
         longPath = _geometry.CheckLongPath(player, *start, cur);
         hasLongPath = true;
 
-        if (!longPath.blocked && longPath.pathExists)
+        // A walkable route that stays inside the movement budget means the unit really could
+        // have walked from start to cur: the blocked straight line was a chord across the
+        // obstacle (a tree, a crystal, a corner, the concave side of a wall), not a wall
+        // crossing. Verify every blocked segment here, not only the merged micro-step ones -
+        // normal running speed is exactly the case that produced the false rollbacks.
+        //
+        // Only static geometry may be excused this way: the navmesh is baked from static data
+        // and knows nothing about dynamic gameobjects (doors, gates), so for those its
+        // "walkable" verdict is unsound and the collision evidence must stand.
+        if (geometry.staticBlocker && !longPath.blocked && longPath.pathExists)
         {
             resetWindow();
             return std::nullopt;
-        }
-
-        if (ctx.noClipWindowStartMs == 0 || (cur.serverMs - ctx.noClipWindowStartMs) > cfg.noClipCumulativeWindowMs)
-        {
-            ctx.noClipWindowStartMs = cur.serverMs;
-            ctx.noClipBlockedHits = 0;
         }
     }
 
@@ -2625,6 +2714,9 @@ std::optional<AegisEvidenceEvent> AcAegisMgr::DetectNoClip(Player* player, Aegis
     evidence.level = (!geometry.reachable || geometry.reason == "segment-unreachable" || cumulativePath) ? AegisEvidenceLevel::Strong : AegisEvidenceLevel::Medium;
     evidence.tag = cumulativePath ? "BlockedMicroPath" : "BlockedSegment";
     evidence.detail = hasLongPath ? geometry.reason + "|" + longPath.reason : geometry.reason;
+    // Which collision layer produced the hit decides whether the (static-only) navmesh may
+    // excuse the segment at all, so it belongs in the audit instead of being inferred later.
+    evidence.detail += geometry.staticBlocker ? "|blocker=static" : "|blocker=dynamic";
     evidence.riskDelta = ClampRiskDelta(evidence.level == AegisEvidenceLevel::Strong ? 18.0f : 12.0f);
     evidence.serverMs = cur.serverMs;
     evidence.shouldRollback = evidence.level == AegisEvidenceLevel::Strong;
@@ -3231,23 +3323,23 @@ void AcAegisMgr::NotifyGms(Player* player, AegisEvidenceEvent const& evidence, A
     WriteAuditLog("gm_notify", player, &ctx, audit.str());
 }
 
-void AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
+bool AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
 {
     if (!player)
-        return;
+        return false;
 
     if (!CanSafelyTeleportForPunish(player))
     {
         WriteAuditLog("rollback_skipped", player, &ctx,
             "\"reason\":\"unsafe-teleport-state\"");
-        return;
+        return false;
     }
 
     if (!ctx.safePosition.valid)
     {
         WriteAuditLog("rollback_skipped", player, &ctx,
             "\"reason\":\"no-safe-position\"");
-        return;
+        return false;
     }
 
     // The rollback target is only refreshed by samples that produced no evidence, so a
@@ -3260,7 +3352,7 @@ void AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
     {
         WriteAuditLog("rollback_skipped", player, &ctx,
             "\"reason\":\"safe-position-too-old\"");
-        return;
+        return false;
     }
 
     if (ctx.safePosition.mapId == player->GetMapId())
@@ -3278,6 +3370,7 @@ void AcAegisMgr::Rollback(Player* player, AegisPlayerContext& ctx) const
           << ",\"targetO\":" << ctx.safePosition.o
           << ",\"ageMs\":" << (_elapsedMs >= ctx.safePosition.serverMs ? _elapsedMs - ctx.safePosition.serverMs : 0);
     WriteAuditLog("rollback", player, &ctx, audit.str());
+    return true;
 }
 
 void AcAegisMgr::ApplyDebuff(Player* player) const
@@ -3308,19 +3401,21 @@ void AcAegisMgr::SetHomebind(Player* player, uint32 mapId, float x, float y, flo
     player->SetHomebind(location, areaId);
 }
 
-void AcAegisMgr::Jail(Player* player, AegisPlayerContext& ctx) const
+bool AcAegisMgr::Jail(Player* player, AegisPlayerContext& ctx) const
 {
     if (!player)
-        return;
+        return false;
 
     AegisConfig const& cfg = sAcAegisConfig->Get();
     SetHomebind(player, cfg.jailMapId, cfg.jailX, cfg.jailY, cfg.jailZ);
 
     if (!CanSafelyTeleportForPunish(player))
     {
+        // The sentence is already recorded in ctx.punish / the database by the caller, and
+        // EnforceJail() moves the player as soon as the teleport state is safe again.
         WriteAuditLog("jail_deferred", player, &ctx,
             "\"reason\":\"unsafe-teleport-state\"");
-        return;
+        return false;
     }
 
     player->TeleportTo(cfg.jailMapId, cfg.jailX, cfg.jailY, cfg.jailZ, cfg.jailO);
@@ -3349,6 +3444,7 @@ void AcAegisMgr::Jail(Player* player, AegisPlayerContext& ctx) const
           << ",\"targetO\":" << cfg.jailO
           << ",\"keepDebuff\":" << (cfg.jailKeepDebuff ? "true" : "false");
     WriteAuditLog("jail_apply", player, &ctx, audit.str());
+    return true;
 }
 
 void AcAegisMgr::Release(Player* player, AegisPlayerContext& ctx) const
@@ -3725,9 +3821,14 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
     {
         if (canTeleportForPunish)
         {
-            Rollback(player, ctx);
-            rollbackExecuted = true;
-            announcedAction = AegisActionType::Rollback;
+            // Rollback() can still refuse (no safe position, a stale one, or a teleport state
+            // that changed since the check above), and the audit, the announcement and the
+            // broadcast must describe what happened rather than what was decided.
+            rollbackExecuted = Rollback(player, ctx);
+            if (rollbackExecuted)
+                announcedAction = AegisActionType::Rollback;
+            else if (executionResult == "observe")
+                executionResult = "rollback-deferred-unsafe-state";
         }
         else if (executionResult == "observe")
             executionResult = "rollback-deferred-unsafe-state";
@@ -3768,9 +3869,8 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
             ctx.punish.punishStage = AegisPunishStage::Jail;
             ctx.punish.jailUntilEpoch = nowEpoch + decision.jailSeconds;
             SetHomebind(player, cfg.jailMapId, cfg.jailX, cfg.jailY, cfg.jailZ);
-            if (canTeleportForPunish)
+            if (canTeleportForPunish && Jail(player, ctx))
             {
-                Jail(player, ctx);
                 executionResult = "jail-applied";
                 actionTaken = true;
                 announcedAction = AegisActionType::Jail;
@@ -3778,6 +3878,8 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
                     ChatHandler(player->GetSession()).SendSysMessage(BuildPunishPlayerMessage(cfg.jailApplyMessage, FormatDurationShort(decision.jailSeconds)));
             }
             else
+                // Jail() has already written the jail_deferred row; the sentence itself is
+                // persisted below and EnforceJail() applies it on the next leash check.
                 executionResult = "jail-deferred-unsafe-state";
         }
         else
@@ -3835,7 +3937,12 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
         ReplaceAll(broadcast, "{player}", playerName);
         ReplaceAll(broadcast, "{type}", cheatLabel);
         ReplaceAll(broadcast, "{action}", ActionTypeTextZh(announcedAction));
-        ChatHandler(nullptr).SendWorldText(std::string_view(broadcast));
+        // Session-less broadcast: only the (char const* / id + args) template overloads fan out over
+        // all valid sessions and give the handler a real session. Passing a std::string_view or
+        // std::string here selects the plain ChatHandler::SendWorldText(std::string_view) overload
+        // instead, which dereferences the null _session and aborts on the ASSERT in
+        // WorldSession::SendPacket (crash of 2026-09-23). Keep the text as a format argument.
+        ChatHandler(nullptr).SendWorldText("{}", broadcast);
     }
 
     std::ostringstream audit;
@@ -3876,6 +3983,78 @@ bool AcAegisMgr::ExecuteAction(Player* player, AegisPlayerContext& ctx, AegisEvi
     actionPayload << ',' << audit.str() << '}';
     WriteAegisLog("audit", actionPayload.str());
     return actionTaken;
+}
+
+void AcAegisMgr::NoteDoorStateChanged(GameObject* go, uint32 state)
+{
+    if (!go || go->GetGoType() != GAMEOBJECT_TYPE_DOOR)
+        return;
+
+    uint32 const nowMs = _elapsedMs;
+
+    std::lock_guard<std::mutex> lock(_doorOpenMutex);
+    if (state == GO_STATE_READY)
+    {
+        // Closed again: a segment that straddles this moment was walked while the door was
+        // still open, so the crossing must not be judged against the closing state.
+        _doorClosedMs[go->GetGUID()] = nowMs;
+    }
+    else
+    {
+        // Opened: excuses a player who is still walking through while it auto-closes.
+        _doorOpenMs[go->GetGUID()] = nowMs;
+        _doorClosedMs.erase(go->GetGUID());
+    }
+
+    // The maps only need doors that changed state recently; prune once they grow past a bound.
+    if (_doorOpenMs.size() > 4096 || _doorClosedMs.size() > 4096)
+    {
+        uint32 const maxAgeMs = sAcAegisConfig->Get().noClipDoorOpenGraceMs * 4u;
+        auto prune = [nowMs, maxAgeMs](std::unordered_map<ObjectGuid, uint32>& map)
+        {
+            for (auto itr = map.begin(); itr != map.end();)
+            {
+                if (nowMs > itr->second && (nowMs - itr->second) > maxAgeMs)
+                    itr = map.erase(itr);
+                else
+                    ++itr;
+            }
+        };
+
+        prune(_doorOpenMs);
+        prune(_doorClosedMs);
+    }
+}
+
+bool AcAegisMgr::IsDoorRecentlyOpened(ObjectGuid const& guid, uint32 nowMs) const
+{
+    std::lock_guard<std::mutex> lock(_doorOpenMutex);
+
+    auto itr = _doorOpenMs.find(guid);
+    if (itr == _doorOpenMs.end())
+        return false;
+
+    uint32 const graceMs = sAcAegisConfig->Get().noClipDoorOpenGraceMs;
+    return nowMs < itr->second || (nowMs - itr->second) <= graceMs;
+}
+
+bool AcAegisMgr::IsDoorClosedSince(ObjectGuid const& guid, uint32 atMs, uint32& closedSinceMs) const
+{
+    std::lock_guard<std::mutex> lock(_doorOpenMutex);
+
+    auto itr = _doorClosedMs.find(guid);
+    if (itr == _doorClosedMs.end())
+    {
+        // No transition seen since the door was loaded: it was already closed when the
+        // segment started (or the state never changed at all).
+        closedSinceMs = 0;
+        return true;
+    }
+
+    closedSinceMs = itr->second;
+    // The door turned READY after the segment started, so the segment was walked against an
+    // open door (or against a door that changed under the player) - not actionable.
+    return closedSinceMs <= atMs;
 }
 
 bool AcAegisMgr::HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEvidenceEvent const& evidence)
@@ -3931,6 +4110,31 @@ bool AcAegisMgr::HandleEvidence(Player* player, AegisPlayerContext& ctx, AegisEv
           << ",\"decisionRollback\":" << (decision.shouldRollback ? "true" : "false")
           << ",\"decisionPersistOffense\":"
           << (decision.persistOffense ? "true" : "false");
+
+    // The movement diagnostics of the sample that produced this evidence. Without them a
+    // speed / teleport event cannot be replayed at all: the audit used to carry only
+    // metricA/metricB, so "was this a hack or a server displacement whose grace had just
+    // expired?" could not be answered from the log (production log 2026-09-23, 21:59/22:00).
+    // They are written unconditionally, not behind Log.Verbose, because they are evidence.
+    if (ctx.samples.Size() >= 2)
+    {
+        AegisMoveSample const& newest = ctx.samples.Newest();
+        AegisMoveSample const& previous = ctx.samples.Previous();
+        int64 const serverDtMs = static_cast<int64>(newest.serverMs) - static_cast<int64>(previous.serverMs);
+        int64 const clientDtMs = static_cast<int64>(newest.clientMs) - static_cast<int64>(previous.clientMs);
+
+        audit << ",\"sampleDtMs\":" << serverDtMs
+              << ",\"sampleClientLeadMs\":" << (clientDtMs - serverDtMs)
+              << ",\"sampleAllowedSpeed\":" << newest.allowedSpeed
+              << ",\"sampleLatencyMs\":" << newest.latencyMs
+              << ",\"sampleMoveFlags\":" << newest.moveFlags
+              << ",\"sampleMoveFlags2\":" << newest.moveFlags2
+              << ",\"sampleOpcode\":" << newest.opcode
+              << ",\"sampleX\":" << newest.x
+              << ",\"sampleY\":" << newest.y
+              << ",\"sampleZ\":" << newest.z;
+    }
+
     WriteAuditLog("evidence", player, &ctx, audit.str());
 
     // Detection records and risk are applied immediately; the punishment itself is
@@ -3986,16 +4190,36 @@ void AcAegisMgr::ProcessPendingActions()
         _pendingActions.pop_front();
         ++processed;
 
+        // Every path out of this loop is reported: a decided punishment that is never executed
+        // used to disappear without a trace, which left the audit claiming an action that the
+        // player never saw (production log 2026-09-23, 21:02:02).
+        std::string const dropFields = "\"guid\":" + std::to_string(pending.guidLow) +
+            ",\"tag\":\"" + EscapeJson(pending.evidence.tag) + "\"" +
+            ",\"queuedAgeMs\":" + std::to_string(_elapsedMs >= pending.queuedMs ? _elapsedMs - pending.queuedMs : 0) +
+            ",\"reason\":";
+
         if (std::find(handledGuids.begin(), handledGuids.end(), pending.guidLow) != handledGuids.end())
+        {
+            WriteAuditLog("action_dropped", nullptr, nullptr,
+                dropFields + "\"already-handled-this-drain\"");
             continue;
+        }
 
         Player* player = ObjectAccessor::FindPlayerByLowGUID(pending.guidLow);
         if (!player || !player->IsInWorld())
+        {
+            WriteAuditLog("action_dropped", player, nullptr,
+                dropFields + "\"player-not-in-world\"");
             continue;
+        }
 
         auto it = _players.find(pending.guidLow);
         if (it == _players.end() || !it->second.online)
+        {
+            WriteAuditLog("action_dropped", player, it == _players.end() ? nullptr : &it->second,
+                dropFields + "\"context-offline\"");
             continue;
+        }
 
         ExecuteAction(player, it->second, pending.evidence, pending.decision);
         handledGuids.push_back(pending.guidLow);
@@ -4567,6 +4791,14 @@ void AcAegisMgr::OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/)
     }
 
     if (std::find(sAcAegisConfig->Get().afkIgnoreSpellIds.begin(), sAcAegisConfig->Get().afkIgnoreSpellIds.end(), spellInfo->Id) != sAcAegisConfig->Get().afkIgnoreSpellIds.end())
+        ctx.gather.lastWhitelistActionMs = _elapsedMs;
+
+    // Fishing is the one legitimate activity that is a perfect match for the gather detector's
+    // shape: the player never moves and never gains a gathering skill, they only loot (one
+    // fish per cast). Without this an angler accumulates the same "0 yards moved, N loots, no
+    // nodes" window as a fixed-position farm bot, so casting Fishing refreshes the same grace
+    // the IgnoreSpellIds list uses. The core has no constant for the client's Fishing spell.
+    if (sAcAegisConfig->Get().afkIgnoreFishing && spellInfo->Id == 7620)
         ctx.gather.lastWhitelistActionMs = _elapsedMs;
 }
 

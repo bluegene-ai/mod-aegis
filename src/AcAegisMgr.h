@@ -2,6 +2,7 @@
 #define MOD_AC_AEGIS_MGR_H
 
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 
@@ -12,6 +13,7 @@
 #include "AcAegisPersistence.h"
 #include "AcAegisTypes.h"
 
+class GameObject;
 class Player;
 class Spell;
 class Unit;
@@ -85,6 +87,13 @@ public:
     void OnGatherAction(Player* player);
     void OnCanFlyByServer(Player* player, bool apply);
     void OnUnderAckMount(Player* player);
+
+    // Called from the gameobject state hook: remembers when a door was opened (so that a
+    // player still walking through it while it auto-closes, or while their own client has
+    // not caught up, is not flagged as clipping through a closed door) and when it was
+    // closed again (so that a door which closed *during* the judged segment cannot be used
+    // as evidence - see IsDoorClosedSince()).
+    void NoteDoorStateChanged(GameObject* go, uint32 state);
     void OnVehicleTransition(Player* player);
     void OnRootAckUpd(Player* player);
     void OnMovementInfoUpdate(Player* player, MovementInfo const& movementInfo);
@@ -154,11 +163,20 @@ private:
     bool QueuePendingAction(Player* player, AegisEvidenceEvent const& evidence, AegisActionDecision const& decision);
     void ProcessPendingActions();
     void NotifyGms(Player* player, AegisEvidenceEvent const& evidence, AegisPlayerContext const& ctx) const;
-    void Rollback(Player* player, AegisPlayerContext& ctx) const;
+    // Both report whether the player was actually moved: the caller may only claim a
+    // rollback / a jail in the audit (and in the broadcast) when it really happened.
+    bool Rollback(Player* player, AegisPlayerContext& ctx) const;
+    bool IsDoorRecentlyOpened(ObjectGuid const& guid, uint32 nowMs) const;
+    // True when the door's last transition into GO_STATE_READY happened no later than atMs;
+    // closedSinceMs receives that timestamp (0 = the door has not changed state since it was
+    // loaded, so it counts as closed). False means the door closed during or after the segment
+    // being judged, which is not actionable: the player may have started crossing while the
+    // door was still open.
+    bool IsDoorClosedSince(ObjectGuid const& guid, uint32 atMs, uint32& closedSinceMs) const;
     void ApplyDebuff(Player* player) const;
     void ClearDebuffs(Player* player) const;
     void SetHomebind(Player* player, uint32 mapId, float x, float y, float z) const;
-    void Jail(Player* player, AegisPlayerContext& ctx) const;
+    bool Jail(Player* player, AegisPlayerContext& ctx) const;
     void Release(Player* player, AegisPlayerContext& ctx) const;
     std::string BuildBanReason(AegisEvidenceEvent const& evidence, uint32 offenseCount, uint8 offenseTier, float risk) const;
     std::string ExecuteBan(Player* player, AegisActionDecision const& decision) const;
@@ -178,6 +196,14 @@ private:
     std::deque<AegisPendingAction> _pendingActions;
     AcAegisGeometry _geometry;
     AcAegisPersistence _persistence;
+
+    // Door guid -> _elapsedMs of the last state change. Written from the gameobject state
+    // hook, which can run on map threads, and read from the movement path, so both maps are
+    // guarded by the same mutex. A guid missing from _doorClosedMs never changed state since
+    // it was loaded, so it counts as closed for IsDoorClosedSince().
+    std::unordered_map<ObjectGuid, uint32> _doorOpenMs;
+    std::unordered_map<ObjectGuid, uint32> _doorClosedMs;
+    mutable std::mutex _doorOpenMutex;
 };
 
 #define sAcAegisMgr AcAegisMgr::instance()

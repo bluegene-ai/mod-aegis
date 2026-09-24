@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "Optional.h"
+#include "GameObject.h"
 #include "Map.h"
 #include "PathGenerator.h"
 #include "Player.h"
@@ -88,13 +89,16 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
     float startX, float startY, float startZ,
     float endX, float endY, float endZ,
     float& hitX, float& hitY, float& hitZ,
-    bool* hitPointValid) const
+    bool* hitPointValid,
+    bool* staticBlocker) const
 {
     Map* map = player ? player->GetMap() : nullptr;
     if (!player || !player->IsInWorld() || !map)
     {
         if (hitPointValid)
             *hitPointValid = false;
+        if (staticBlocker)
+            *staticBlocker = false;
 
         return false;
     }
@@ -116,6 +120,8 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
     {
         if (hitPointValid)
             *hitPointValid = false;
+        if (staticBlocker)
+            *staticBlocker = false;
 
         return false;
     }
@@ -124,12 +130,13 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
     // position from the same collision trees so callers no longer have to treat a
     // synthetic midpoint as if it were a hit point.
     bool found = false;
+    bool bestDynamic = false;
     float bestX = 0.0f;
     float bestY = 0.0f;
     float bestZ = 0.0f;
     float bestDistSq = std::numeric_limits<float>::max();
 
-    auto considerHit = [&](float candidateX, float candidateY, float candidateZ, bool valid)
+    auto considerHit = [&](float candidateX, float candidateY, float candidateZ, bool valid, bool dynamic)
     {
         if (!valid)
             return;
@@ -144,6 +151,7 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
             bestX = candidateX;
             bestY = candidateY;
             bestZ = candidateZ;
+            bestDynamic = dynamic;
             found = true;
         }
     };
@@ -156,7 +164,7 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
         bool staticHit = map->GetMapCollisionData().GetStaticTree().GetObjectHitPos(
             startX, startY, startZ, endX, endY, endZ,
             staticX, staticY, staticZ, 0.0f);
-        considerHit(staticX, staticY, staticZ, staticHit);
+        considerHit(staticX, staticY, staticZ, staticHit, false);
     }
 
     {
@@ -167,7 +175,7 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
             player->GetPhaseMask(),
             startX, startY, startZ, endX, endY, endZ,
             dynamicX, dynamicY, dynamicZ, 0.0f);
-        considerHit(dynamicX, dynamicY, dynamicZ, dynamicHit);
+        considerHit(dynamicX, dynamicY, dynamicZ, dynamicHit, true);
     }
 
     if (found)
@@ -187,6 +195,11 @@ bool AcAegisGeometry::RaycastStaticAndDynamic(Player* player,
 
     if (hitPointValid)
         *hitPointValid = found;
+
+    // Only a hit that we could positively attribute to the static tree counts as static;
+    // an unattributable block must not be excused by the (static-only) navmesh.
+    if (staticBlocker)
+        *staticBlocker = found && !bestDynamic;
 
     return true;
 }
@@ -210,7 +223,8 @@ AegisGeometryResult AcAegisGeometry::CheckShortSegment(Player* player,
         from.x, from.y, from.z + zOffset,
         to.x, to.y, to.z + zOffset,
         hitX, hitY, hitZ,
-        &result.hitValid);
+        &result.hitValid,
+        &result.staticBlocker);
 
     float remainingDistance = 0.0f;
     if (blocked)
@@ -289,7 +303,116 @@ AegisGeometryResult AcAegisGeometry::CheckLongPath(Player* player,
         return result;
     }
 
-    result.blocked = result.directDistance > 0.1f && result.pathLength > (result.directDistance * 2.8f);
+    // A blocked straight segment is only evidence when the walkable detour is out of reach
+    // as well. The previous test used a fixed ratio to the straight distance
+    // (pathLength > directDistance * 2.8), which scales with the segment instead of with the
+    // time the unit had: on a 4 yard step it tolerated an 11 yard detour - roughly three
+    // times what the movement speed can cover in that window - while still flagging the
+    // curved route a player runs around a tree, a crystal or a corner. Compare against the
+    // distance the unit can actually cover between the two samples instead: the same speed
+    // tolerance the NoClip detector already grants (MaxSpeedMultiplier), plus a small
+    // allowance for navmesh approximation. Crossing a wall needs a detour far beyond that.
+    float const dtSeconds = to.serverMs > from.serverMs ?
+        static_cast<float>(to.serverMs - from.serverMs) / 1000.0f : 0.0f;
+    float const allowedSpeed = std::max(from.allowedSpeed, to.allowedSpeed);
+    float const budget = std::max(result.directDistance + cfg.pathBudgetSlackYards,
+        allowedSpeed * dtSeconds * cfg.pathBudgetSpeedFactor);
+
+    result.blocked = result.pathLength > budget;
     result.reason = result.blocked ? "path-too-long" : "path-ok";
+    return result;
+}
+
+AegisDoorCrossResult AcAegisGeometry::CheckClosedDoorCross(Player* player,
+    AegisMoveSample const& from,
+    AegisMoveSample const& to,
+    float hitX, float hitY, float hitZ, bool hitValid) const
+{
+    AegisDoorCrossResult result;
+
+    AegisConfig const& cfg = sAcAegisConfig->Get();
+    if (!cfg.noClipDoorCrossEnabled || !player || !player->IsInWorld())
+        return result;
+
+    // Doors are modelled from their base upward; the crossing has to happen inside that
+    // vertical band. Doors are 3-4 yards tall, so a band starting slightly below the base
+    // is enough and nobody walks through a door at a height where the model has no door.
+    constexpr float kDoorBaseTolerance = 1.0f;
+    constexpr float kDoorTopYards = 4.5f;
+    constexpr float kHitToleranceYards = 0.75f;
+
+    float const direct = Dist3D(from.x, from.y, from.z, to.x, to.y, to.z);
+    float const searchRange = direct + cfg.noClipDoorCrossHalfWidthYards;
+
+    // Only the nearest door is inspected: doors are sparse and the inspected segment is a
+    // few yards long, so the door being crossed is normally the nearest one. Missing one
+    // only costs detection - this rule never invents a crossing.
+    GameObject* door = player->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_DOOR, searchRange);
+    if (!door || !door->IsInWorld() || door->GetMap() != player->GetMap())
+        return result;
+
+    // An open door (in either active state) is passable by design.
+    if (door->GetGoState() != GO_STATE_READY)
+        return result;
+
+    if (!(door->GetPhaseMask() & player->GetPhaseMask()))
+        return result;
+
+    // WoW positions use x = x0 + d * cos(o), y = y0 + d * sin(o), so (cos o, sin o) is the
+    // door's facing normal and (-sin o, cos o) its width axis.
+    float const orientation = door->GetOrientation();
+    float const normalX = std::cos(orientation);
+    float const normalY = std::sin(orientation);
+    float const widthX = -normalY;
+    float const widthY = normalX;
+
+    float const doorX = door->GetPositionX();
+    float const doorY = door->GetPositionY();
+    float const doorZ = door->GetPositionZ();
+
+    float const fromSide = (from.x - doorX) * normalX + (from.y - doorY) * normalY;
+    float const toSide = (to.x - doorX) * normalX + (to.y - doorY) * normalY;
+    if ((fromSide > 0.0f) == (toSide > 0.0f))
+        return result;                                  // both endpoints on the same side
+
+    float const denominator = fromSide - toSide;
+    if (std::fabs(denominator) < 0.0001f)
+        return result;
+
+    float const t = fromSide / denominator;
+    if (t <= 0.0f || t >= 1.0f)
+        return result;
+
+    float const crossZ = from.z + (to.z - from.z) * t;
+    if (crossZ < doorZ - kDoorBaseTolerance || crossZ > doorZ + kDoorTopYards)
+        return result;
+
+    float const crossX = from.x + (to.x - from.x) * t;
+    float const crossY = from.y + (to.y - from.y) * t;
+    float const lateral = std::fabs((crossX - doorX) * widthX + (crossY - doorY) * widthY);
+    if (lateral > cfg.noClipDoorCrossHalfWidthYards)
+        return result;                                  // walked past beside the door
+
+    result.door = door;
+    result.crossed = true;
+    result.lateralOffset = lateral;
+
+    // Corroboration from the collision layer: its own hit point sits on this door's slab.
+    if (hitValid)
+    {
+        float const hitOffsetX = hitX - doorX;
+        float const hitOffsetY = hitY - doorY;
+        float const hitLateral = std::fabs(hitOffsetX * widthX + hitOffsetY * widthY);
+        float const hitPlane = std::fabs(hitOffsetX * normalX + hitOffsetY * normalY);
+        if (hitLateral <= cfg.noClipDoorCrossHalfWidthYards + kHitToleranceYards &&
+            hitPlane <= kHitToleranceYards &&
+            hitZ > doorZ - kDoorBaseTolerance - kHitToleranceYards &&
+            hitZ < doorZ + kDoorTopYards + kHitToleranceYards)
+        {
+            result.collisionConfirmed = true;
+            result.hitPlaneDistance = hitPlane;
+        }
+    }
+
     return result;
 }

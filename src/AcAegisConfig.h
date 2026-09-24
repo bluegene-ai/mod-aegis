@@ -101,6 +101,21 @@ struct AegisConfig
     uint32 noClipCumulativeWindowMs = 1800;
     float noClipCumulativeMinDistance = 2.8f;
     uint32 noClipCumulativeStrongHits = 3;
+    bool noClipDoorCrossEnabled = true;
+    float noClipDoorCrossHalfWidthYards = 2.0f;
+    // A door opened this recently is never reported. The window has to stay well above the
+    // door's own auto-close time: at 3000 ms it was exactly equal to the 3000 ms auto-close
+    // of the Scarlet Monastery wing doors, and the state is read when the segment is judged
+    // rather than when it was walked, so a player who opened a door and walked through it
+    // could still be judged against an already closed door with no margin left.
+    uint32 noClipDoorOpenGraceMs = 8000;
+    // Whether walking through a *closed* door may be treated as actionable (Strong) evidence.
+    // Off by default: the door's state and the door's collision are two views of the same
+    // server-side state (GameObject::SetGoState() flips both), so a client that still shows
+    // the door open - a loading screen, a missed state update, or another player having
+    // toggled it - produces exactly the same evidence as a client whose collision was
+    // removed. With this off the crossing is still recorded as Weak evidence for triage.
+    bool noClipDoorCrossActionable = false;
 
     bool flyEnabled = true;
     float flyMinHeightAboveGround = 6.0f;
@@ -125,7 +140,12 @@ struct AegisConfig
     float mountIndoorMinMoveDistance = 0.5f;
 
     bool forceMoveEnabled = true;
-    uint32 forceMoveGraceMs = 1200;
+    // Server-issued displacement (knockback / pull / charge / root ack) grace. A knockback
+    // trajectory commonly lasts longer than a second, and while it plays out the client
+    // keeps reporting real 20+ yd/s movement, so a grace shorter than the flight turns a
+    // legitimate knockback into speed evidence (the 2026-09-23 production log has two such
+    // isolated SpeedEnvelope spikes on a character the server believed was walking).
+    uint32 forceMoveGraceMs = 2000;
     float forceMoveMinAckSpeedXY = 4.0f;
     float forceMoveMinAckSpeedZ = 2.5f;
     float forceMoveExpectedFactor = 0.25f;
@@ -174,11 +194,19 @@ struct AegisConfig
     float afkCampStationaryEpsilon = 0.25f;
     std::vector<uint32> afkIgnoreSpellIds;
     std::vector<uint32> afkIgnoreAuras;
+    // Fishing is the one legitimate activity that requires standing perfectly still and
+    // produces nothing but loot actions, so the gather detector cannot tell it apart from a
+    // fixed-position farm loop. When this is on, casting Fishing refreshes the same grace as
+    // the IgnoreSpellIds list, so an active angler is never reported. Turn it off on a realm
+    // that wants fishing bots caught as well.
+    bool afkIgnoreFishing = true;
 
     bool geometryEnabled = true;
     bool useVmaps = true;
     bool useMmaps = true;
     bool allowHotPathReachability = false;
+    float pathBudgetSpeedFactor = 1.5f;
+    float pathBudgetSlackYards = 1.0f;
 
     float notifyThreshold = 60.0f;
     float rollbackThreshold = 110.0f;

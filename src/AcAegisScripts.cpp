@@ -4,10 +4,12 @@
 
 #include <ctime>
 
+#include "AllGameObjectScript.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "CommandScript.h"
 #include "DatabaseEnv.h"
+#include "GameObject.h"
 #include "Item.h"
 #include "LootMgr.h"
 #include "Player.h"
@@ -458,11 +460,27 @@ public:
     }
 };
 
+class AcAegisGameObjectScript : public AllGameObjectScript
+{
+public:
+    AcAegisGameObjectScript() : AllGameObjectScript("AcAegisGameObjectScript")
+    {
+    }
+
+    // Feeds the door grace window of the NoClip detector: a door that was genuinely opened
+    // recently must not be reported as "crossed while closed" (auto-close behind the player).
+    void OnGameObjectStateChanged(GameObject* go, uint32 state) override
+    {
+        sAcAegisMgr->NoteDoorStateChanged(go, state);
+    }
+};
+
 void startAcAegisScripts()
 {
     new AcAegisWorldScript();
     new AcAegisPlayerScript();
     new AcAegisMovementHandlerScript();
     new AcAegisVehicleScript();
+    new AcAegisGameObjectScript();
     AddSC_acaegis_commandscript();
 }
